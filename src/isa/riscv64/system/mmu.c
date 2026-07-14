@@ -96,11 +96,8 @@ typedef struct {
 } protection_entry_cache_t;
 
 #ifdef CONFIG_RV_PMP_CHECK
-#if CONFIG_RV_PMP_ACTIVE_NUM > 0
-static protection_entry_cache_t pmp_entry_cache[CONFIG_RV_PMP_ACTIVE_NUM];
-#else
-static protection_entry_cache_t pmp_entry_cache[1];
-#endif
+static protection_entry_cache_t pmp_entry_cache[
+  CONFIG_RV_PMP_ACTIVE_NUM > 0 ? CONFIG_RV_PMP_ACTIVE_NUM : 1];
 
 void mmu_refresh_pmp_cache(void) {
 #if CONFIG_RV_PMP_ACTIVE_NUM > 0
@@ -132,11 +129,8 @@ void mmu_refresh_pmp_cache(void) {
 #endif
 
 #ifdef CONFIG_RV_PMA_CHECK
-#if CONFIG_RV_PMA_ACTIVE_NUM > 0
-static protection_entry_cache_t pma_entry_cache[CONFIG_RV_PMA_ACTIVE_NUM];
-#else
-static protection_entry_cache_t pma_entry_cache[1];
-#endif
+static protection_entry_cache_t pma_entry_cache[
+  CONFIG_RV_PMA_ACTIVE_NUM > 0 ? CONFIG_RV_PMA_ACTIVE_NUM : 1];
 
 void mmu_refresh_pma_cache(void) {
 #if CONFIG_RV_PMA_ACTIVE_NUM > 0
