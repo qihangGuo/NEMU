@@ -425,6 +425,12 @@
 #define ZIHINTPAUSE_INSTR_NULLARY(f)
 #endif //CONFIG_RV_ZIHINTPAUSE
 
+#ifdef CONFIG_CUSTOM_EVU
+#define EVU_INSTR_TERNARY(f) f(xv)
+#else
+#define EVU_INSTR_TERNARY(f)
+#endif
+
 #define INSTR_NULLARY(f) \
   f(inv) f(rt_inv) f(nemu_trap) \
   ZIHINTPAUSE_INSTR_NULLARY(f) \
@@ -484,6 +490,7 @@
   ZVFBF_MIN_INSTR_TERNARY(f) \
   ZVFBF_WMA_INSTR_TERNARY(f) \
   MATRIX_INSTR_TERNARY(f) \
+  EVU_INSTR_TERNARY(f) \
   CBO_INSTR_TERNARY(f) \
   ZIMOP_INSTR_TERNARY(f) \
   ZFH_INSTR_TERNARY(f) \

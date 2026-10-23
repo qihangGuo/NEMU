@@ -379,6 +379,9 @@ void Serializer::serializePMem(uint64_t inst_count, uint8_t *pmem_addr, uint8_t 
 }
 
 void Serializer::serializeRegs(uint8_t* serialize_base_addr) {
+#ifdef CONFIG_CUSTOM_EVU
+  assert(cpu.evu.state == 0 && "Legacy checkpoint format cannot save an EVU context; drain/save it in software first");
+#endif
   auto *intRegCpt = (uint64_t *) (serialize_base_addr + int_reg_cpt_addr);
   for (unsigned i = 0; i < 32; i++) {
     *(intRegCpt + i) = cpu.gpr[i]._64;

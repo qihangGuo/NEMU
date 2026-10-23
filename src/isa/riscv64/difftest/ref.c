@@ -1,3 +1,4 @@
+#include <cpu/difftest/evu.h>
 /***************************************************************************************
 * Copyright (c) 2014-2021 Zihao Yu, Nanjing University
 * Copyright (c) 2020-2022 Institute of Computing Technology, Chinese Academy of Sciences
@@ -140,6 +141,7 @@ static inline void csr_prepare_if_dirty() {
 
 void csr_writeback() {
   mstatus->val = cpu.mstatus;
+  IFDEF(CONFIG_CUSTOM_EVU, mstatus->xs = cpu.evu.state & 3);
   // Keep the value of mstatus->sd always zero
   // The value used to diff with REF/DUT will set mstatus->sd with fs or vs is dirty.
   mstatus->sd  = 0;
@@ -218,6 +220,8 @@ void csr_writeback() {
 
 #ifdef CONFIG_DIFFTEST_CHECK_FCSR
   fcsr->val     = cpu.fcsr;
+  fflags->val = fcsr->fflags.val;
+  frm->val = fcsr->frm;
 #endif // CONFIG_DIFFTEST_CHECK_FCSR
 }
 
@@ -282,9 +286,11 @@ void isa_difftest_regcpy(void *dut, bool direction) {
 void isa_difftest_csrcpy(void *dut, bool direction) {
   if (direction == DIFFTEST_TO_REF) {
     memcpy(csr_array, dut, 4096 * sizeof(rtlreg_t));
+    IFDEF(CONFIG_CUSTOM_EVU, evu_csr_import(csr_array));
     mmu_refresh_pmp_cache();
     mmu_refresh_pma_cache();
   } else {
+    IFDEF(CONFIG_CUSTOM_EVU, evu_csr_export(csr_array));
     memcpy(dut, csr_array, 4096 * sizeof(rtlreg_t));
   }
 }

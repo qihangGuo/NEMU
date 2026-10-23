@@ -1,3 +1,4 @@
+#include <cpu/difftest/evu.h>
 /***************************************************************************************
 * Copyright (c) 2014-2021 Zihao Yu, Nanjing University
 * Copyright (c) 2020-2022 Institute of Computing Technology, Chinese Academy of Sciences
@@ -457,7 +458,7 @@ static inline word_t* csr_decode(uint32_t addr) {
 
 #define MSTATUS_RMASK_UBE 0X1UL << 6
 // when harts without additional user extensions require new state XS read-only zero
-#define MSTATUS_RMASK_XS  0X3UL << 15
+#define MSTATUS_RMASK_XS  (0X3UL << 15)
 #define MSTATUS_RMASK_UXL 0X3UL << 32
 #define MSTATUS_RMASK_SXL 0X3UL << 34
 #define MSTATUS_RMASK_SBE 0X1UL << 36
@@ -969,7 +970,7 @@ inline word_t gen_status_sd(word_t status) {
   bool fs_dirty = xstatus.fs == EXT_CONTEXT_DIRTY;
   bool vs_dirty = xstatus.vs == EXT_CONTEXT_DIRTY;
   bool ms_dirty = xstatus.ms == EXT_CONTEXT_DIRTY;
-  return ((word_t)(fs_dirty || vs_dirty || ms_dirty)) << 63;
+  return ((word_t)(fs_dirty || vs_dirty || ms_dirty || xstatus.xs == EXT_CONTEXT_DIRTY)) << 63;
 }
 
 #ifdef CONFIG_RV_SMCNTRPMF
@@ -1800,6 +1801,9 @@ static inline word_t smcdeleg_read_sireg2(uint64_t iselect) {
 #endif // CONFIG_RV_SMCDELEG
 
 static word_t csr_read(uint32_t csrid) {
+#ifdef CONFIG_CUSTOM_EVU
+  if (evu_csr_address(csrid)) return evu_csr_read(csrid);
+#endif
   word_t *src = csr_decode(csrid);
   switch (csrid) {
     /************************* Unprivileged and User-Level CSRs *************************/
@@ -2132,6 +2136,9 @@ void update_vsatp(const vsatp_t new_val) {
 #endif
 
 static void csr_write(uint32_t csrid, word_t src) {
+#ifdef CONFIG_CUSTOM_EVU
+  if (evu_csr_address(csrid)) { evu_csr_write(csrid, src); return; }
+#endif
   word_t *dest = csr_decode(csrid);
   IFDEF(CONFIG_SHARE, csr_difftest_mark_dirty());
   switch (csrid) {
@@ -3461,6 +3468,9 @@ static inline bool csrind_permit_check(const uint32_t addr) {
 #endif // CONFIG_RV_SMCSRIND
 
 static inline void csr_permit_check(uint32_t addr, bool is_write) {
+#ifdef CONFIG_CUSTOM_EVU
+  if (evu_csr_address(addr)) evu_csr_check(addr);
+#endif
   bool has_vi = false; // virtual instruction
   word_t *dest_access = csr_decode(addr);
   // check csr_exit, priv

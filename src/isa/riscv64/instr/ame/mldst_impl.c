@@ -33,6 +33,7 @@
 #include "ame/mstore_queue_wrapper.h"
 #endif // CONFIG_AME_MEM_ACCESS_CHECK
 #include "mcommon.h"
+#include <cpu/difftest/evu.h>
 #ifdef CONFIG_RV_AME_FP4
 #include "ame/raw-fp4.h"
 #endif
@@ -152,6 +153,8 @@ void exec_mld(Decode *s, uint64_t base_addr, uint64_t row_byte_stride,
   rtl_lmm(s, &base_addr, &row_byte_stride,
     row, column, dsize, is_trans,
     MMU_TRANSLATE, m_name, td);
+  IFDEF(CONFIG_CUSTOM_EVU, evu_matrix_load(td, base_addr, row_byte_stride, row, column,
+    dsize, is_trans, cpu.mcfg[td].type_code == MTYPECODE_INT8 && cpu.mcfg[td].table_set == 0));
 #ifdef CONFIG_AME_TILEREG_UB_CHECK
   // Track the register rectangle in instruction order, including deferred REF loads.
   ame_matrix_region_mark_write(td, row, (uint64_t)column << dsize,

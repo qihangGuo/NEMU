@@ -29,6 +29,7 @@
 #include "mcommon.h"
 #include "mcompute_impl.h"
 #include "rtl/fp.h"
+#include <cpu/difftest/evu.h>
 
 // #define PRINT_AMUCTRLIO
 
@@ -174,6 +175,10 @@ def_EHelper(mmacc) {
 #endif // CONFIG_FPU_NONE
   }
 #endif // CONFIG_SHARE_REF
+  IFDEF(CONFIG_CUSTOM_EVU, evu_matrix_mma(td, ts1, ts2, tile_m, tile_n, tile_k,
+    s1mcfg.type_code == MTYPECODE_INT8 && s2mcfg.type_code == MTYPECODE_INT8 &&
+    dmcfg.type_code == MTYPECODE_INT32 && s1mcfg.table_set == 0 &&
+    s2mcfg.table_set == 0 && dmcfg.table_set == 0, msaten->val));
 #ifdef CONFIG_AME_TILEREG_UB_CHECK
   if (tile_m != 0 && tile_n != 0 && tile_k != 0) {
     ame_matrix_region_mark_write(td, tile_m, tile_n << dsize, s->pc);
@@ -211,6 +216,7 @@ def_EHelper(mmacc) {
 
 def_EHelper(mzero) {
   mp_set_dirty();
+  IFDEF(CONFIG_CUSTOM_EVU, evu_matrix_zero(s->dest.reg));
 #ifndef CONFIG_SHARE_REF
   if (s->dest.reg >= 4) {
     for (int i = 0; i < ROWNUM; i++) {

@@ -93,6 +93,10 @@ typedef struct TriggerModule TriggerModule;
 typedef struct IpriosModule IpriosModule;
 typedef struct IpriosSort IpriosSort;
 
+#ifdef CONFIG_CUSTOM_EVU
+#include "evu-state.h"
+#endif
+
 typedef struct {
   /*** Below will be synced by regcpy when run difftest, DO NOT TOUCH ***/
   union {
@@ -160,6 +164,11 @@ typedef struct {
   uint64_t difftest_state_end;
   /** Above will be used and synced by regcpy when run difftest, DO NOT TOUCH ***/
 
+
+#ifdef CONFIG_CUSTOM_EVU
+  // Exported through dedicated EVU APIs; the existing core regcpy ABI is unchanged.
+  riscv64_EvuState evu;
+#endif
 
   // exec state
   bool amo;

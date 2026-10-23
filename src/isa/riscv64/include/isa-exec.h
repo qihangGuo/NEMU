@@ -55,3 +55,6 @@
 #include "../instr/rvt/exec.h"
 #endif
 #include "../instr/special.h"
+#ifdef CONFIG_CUSTOM_EVU
+#include "../instr/evu/exec.h"
+#endif

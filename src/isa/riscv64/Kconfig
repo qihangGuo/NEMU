@@ -137,6 +137,29 @@ config CUSTOM_XVEXP2_BF16
   help
     Enable the non-standard vfexp2bf16.v instruction for BF16.
 
+config CUSTOM_EVU
+  bool "XSAI external vector execution reference"
+  depends on FPU_SOFT
+  default n
+  help
+    Model the independent XSAI external-vector architectural register bank and
+    its integer, floating-point, reduction, permutation, Exp2, quantization,
+    LOAD/STORE, matrix launch, and synchronization commands. Core RVV state
+    remains independent. The matrix producer reference remains deliberately
+    narrower than the general vector execution model.
+
+config CUSTOM_EVU_VLEN
+  int "External vector register length in bits"
+  depends on CUSTOM_EVU
+  default 4096
+  range 512 4096
+
+config CUSTOM_EVU_DLEN
+  int "External vector special-path datapath width in bits"
+  depends on CUSTOM_EVU
+  default 256
+  range 64 1024
+
 config CUSTOM_TENSOR
   depends on !FPU_NONE
   bool "RISC-V Tensor Extension (Internal Spec)"
