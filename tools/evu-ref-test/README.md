@@ -31,7 +31,8 @@ cases: all 32 preexisting flag combinations, exact/inexact/invalid/overflow/
 underflow/divide-by-zero operations, synchronous/asynchronous publication, and
 FRM preservation. Only the first element raises exceptions; subsequent exact
 elements must not erase the accumulated command flags. Async issue preserves
-scalar FCSR; completion merges the command flags into it.
+scalar FCSR; completion publishes the command flags only to independent EVU efflags.
+Scalar FCSR/FRM and FS/VS/vstart must remain unchanged.
 
 ## Online softmax and RTL comparison
 
