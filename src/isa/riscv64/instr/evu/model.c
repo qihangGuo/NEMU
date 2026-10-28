@@ -84,7 +84,8 @@ static uint64_t evu_csr_peek(uint32_t addr) {
   case 0x8c2: return cpu.evu.vxsat;
   case 0xbc8: return cpu.evu.state;
   case 0xcd0: return EVU_VLEN_BYTES;
-  case 0xcd1: return UINT64_C(1) | (UINT64_C(8) << 8) | (UINT64_C(7) << 16) | (UINT64_C(1) << 24);
+  case 0xcd1: return UINT64_C(1) | (UINT64_C(8) << 8) | (UINT64_C(7) << 16) | (UINT64_C(1) << 24) |
+    ((uint64_t)(CONFIG_CUSTOM_EVU_DLEN == 256) << 25) | (UINT64_C(1) << 26);
   case 0xcd2: return cpu.evu.status;
   case 0xcd3: return cpu.evu.cause;
   case 0xcd4: return cpu.evu.epc;
@@ -306,7 +307,7 @@ static void execute_memory(EvuJob *job) {
 
 static bool is_control(uint32_t opcode) {
   return opcode == EVU_LAUNCH || opcode == EVU_WAIT || opcode == EVU_FENCE || opcode == EVU_SETVLI ||
-         opcode == EVU_SETVL || opcode == EVU_SETCFG;
+         opcode == EVU_SETVL;
 }
 
 static bool is_supported_opcode(uint32_t opcode) {
@@ -354,8 +355,8 @@ static bool is_supported_opcode(uint32_t opcode) {
   case EVU_SETVLI:
   case EVU_SETVL:
   case EVU_GATHER:
-  case EVU_QUANT_TO_CUTE:
-  case EVU_SETCFG:
+  case EVU_GATHER_IMM:
+  case EVU_FP_QUANT_TO_CUTE:
   case EVU_LAUNCH:
   case EVU_WAIT:
   case EVU_FENCE:
@@ -366,10 +367,11 @@ static bool is_supported_opcode(uint32_t opcode) {
 }
 
 static bool valid_width(uint32_t opcode, uint32_t sew) {
-  if (is_control(opcode) && opcode != EVU_SETCFG)
+  if (is_control(opcode))
     return true;
   if (sew > 2)
     return false;
+  if (opcode == EVU_FP_QUANT_TO_CUTE) return sew == 2;
   if (opcode == EVU_WADD || opcode == EVU_WSUB || opcode == EVU_WMUL)
     return sew < 2;
   if (opcode == EVU_FADD || opcode == EVU_FSUB || opcode == EVU_FMUL || opcode == EVU_FMACC || opcode == EVU_FDIV ||
@@ -396,23 +398,29 @@ static void execute_setv(Decode *s, EvuJob *job) {
 void evu_execute(Decode *s, uint32_t instr, uint64_t base) {
   save_globals(s);
   if (!evu_permitted()) longjmp_exception(EX_II);
-  const uint32_t opcode = instr >> 25;
+  const uint32_t raw_opcode = instr >> 25;
+  const uint32_t opcode = evu_canonical_opcode(raw_opcode);
   const uint32_t sew = (instr >> 12) & 0x7;
-  if (!is_supported_opcode(opcode) || !valid_width(opcode, sew) ||
+  if ((evu_scalar_form(raw_opcode) && sew != 2) || !is_supported_opcode(opcode) || !valid_width(opcode, sew) ||
       (opcode == EVU_LAUNCH && (sew != 4 || !evu_matrix_physical_mode()))) {
     longjmp_exception(EX_II);
   }
 #ifndef CONFIG_RV_AME
-  if (opcode == EVU_LAUNCH)
+  if (opcode == EVU_LAUNCH || opcode == EVU_FP_QUANT_TO_CUTE)
     longjmp_exception(EX_II);
 #endif
 
   const EvuVType current = evu_current_vtype();
+  if (evu_scalar_form(raw_opcode) && (current.lmul != 0 || (cpu.evu.configured && current.sew != 2)))
+    longjmp_exception(EX_II);
   if (!is_control(opcode) && current.vill)
     longjmp_exception(EX_II);
   // The current CUTE quantizer streams one physical VRF register. Larger
   // groups would wrap its chunk counter and must fail before retirement.
-  if (opcode == EVU_QUANT_TO_CUTE && evu_lmul_regs(current.lmul) > 1)
+  if (opcode == EVU_FP_QUANT_TO_CUTE && evu_lmul_regs(current.lmul) > 1)
+    longjmp_exception(EX_II);
+  if (opcode == EVU_FP_QUANT_TO_CUTE &&
+      (base >> 9 || evu_current_vl(2) > 64 || CONFIG_CUSTOM_EVU_DLEN != 256))
     longjmp_exception(EX_II);
   Assert(count < EVU_QUEUE, "EVU reference command queue overflow");
 
@@ -422,11 +430,12 @@ void evu_execute(Decode *s, uint32_t instr, uint64_t base) {
   job->instr = instr;
   job->base = base;
   job->opcode = opcode;
-  job->sew = cpu.evu.configured && !is_control(opcode) && opcode != EVU_SETCFG ? current.sew : sew;
+  job->sew = cpu.evu.configured && !is_control(opcode) ? current.sew : sew;
   job->vd = (instr >> 7) & 31;
   job->vs1 = (instr >> 15) & 31;
   job->vs2 = (instr >> 20) & 31;
-  job->aux = 0;
+  job->aux = (evu_element_zero(raw_opcode) ? 0x40 : 0) |
+    (evu_scalar_source(raw_opcode) ? 0x20 : 0) | (raw_opcode == EVU_FP_QUANT_SCALAR ? 0x10 : 0);
   job->vstart = 0;
   if (!is_control(opcode) && !valid_width(opcode, job->sew)) longjmp_exception(EX_II);
 
@@ -442,6 +451,8 @@ void evu_execute(Decode *s, uint32_t instr, uint64_t base) {
     job->vl = (uint32_t)cpu.evu.vl;
   } else if (opcode != EVU_WAIT && opcode != EVU_FENCE) {
     job->vl = evu_current_vl(job->sew);
+    if (evu_element_zero(raw_opcode))
+      job->vl = job->vl != 0 && cpu.evu.vstart == 0 ? 1 : 0;
     if (opcode == EVU_LOAD || opcode == EVU_STORE)
       execute_memory(job);
     else
@@ -461,6 +472,12 @@ void evu_execute(Decode *s, uint32_t instr, uint64_t base) {
       const unsigned element_bytes = 1u << job->sew;
       for (uint32_t i = job->vstart; i < job->vl; ++i) {
         memcpy(guest_to_host(job->physical[i]), job->output + (size_t)i * element_bytes, element_bytes);
+      }
+    }
+    if (job->opcode == EVU_FP_QUANT_TO_CUTE && !job->cause) {
+      for (unsigned i = 0; i < job->output_bytes; ++i) {
+        const unsigned row = job->base >> 2;
+        evu_matrix_cute_byte(job->base & 3, row % 8, (row / 8) * 2 + i / 32, i % 32, job->output[i]);
       }
     }
     if ((job->writes_vrf || job->writes_scalar) && !job->cause) {
@@ -553,6 +570,37 @@ int difftest_evu_store(uint64_t addr, const void *data, uint64_t mask) {
   return 0;
 }
 
+int difftest_evu_cute_write(uint32_t reg, uint32_t bank, uint32_t entry,
+                             const void *data, size_t bytes, uint64_t mask) {
+  EvuJob *job = NULL;
+  for (unsigned i = 0; i < count; ++i) {
+    EvuJob *candidate = &jobs[(head + i) % EVU_QUEUE];
+    if (candidate->writes_cute && candidate->written < candidate->output_bytes) {
+      job = candidate;
+      break;
+    }
+  }
+  if (!job || !data || bytes != 32) return 1;
+  if (job->opcode != EVU_FP_QUANT_TO_CUTE) return 1;
+  const unsigned row = job->base >> 2;
+  const unsigned offset = job->written % 32;
+  const unsigned lanes = 8;
+  const unsigned remaining = job->output_bytes - job->written;
+  const unsigned n = remaining < lanes ? remaining : lanes;
+  const uint64_t expected_mask = ((UINT64_C(1) << n) - 1) << offset;
+  if (reg != (job->base & 3) || bank != row % 8 ||
+      entry != (row / 8) * 2 + job->written / 32 ||
+      mask != expected_mask) return 1;
+  const uint8_t *actual = data;
+  for (unsigned i = 0; i < n; ++i)
+    if (actual[offset + i] != job->output[job->written + i]) return 1;
+  // Check the complete event before changing reference state.
+  for (unsigned i = 0; i < n; ++i)
+    evu_matrix_cute_byte(reg, bank, entry, offset + i, job->output[job->written + i]);
+  job->written += n;
+  return 0;
+}
+
 int difftest_evu_complete(uint64_t pc, uint32_t instr, uint8_t flags, bool exception, uint8_t cause) {
   if (!count)
     return 1;
@@ -562,7 +610,8 @@ int difftest_evu_complete(uint64_t pc, uint32_t instr, uint8_t flags, bool excep
   const uint32_t expected_store_bytes = job->writes_memory ? (job->vl - job->vstart) * (1u << job->sew) : 0;
   const bool missing_stores = job->writes_memory && !job->cause && job->written != expected_store_bytes;
   if (job->pc != pc || job->instr != instr || job->flags != flags || (job->cause != 0) != exception ||
-      job->cause != cause || missing_stores) {
+      job->cause != cause || missing_stores ||
+      (job->opcode == EVU_FP_QUANT_TO_CUTE && job->written != job->output_bytes)) {
     fprintf(stderr, "EVU completion mismatch pc=0x%lx/0x%lx instr=0x%x/0x%x flags=0x%x/0x%x stores=%u/%u\n", pc,
             job->pc, instr, job->instr, flags, job->flags, job->written, expected_store_bytes);
     return 1;

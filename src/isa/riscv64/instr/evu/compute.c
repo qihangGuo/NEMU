@@ -17,13 +17,6 @@ void vp_set_dirty(void);
 typedef __int128 int128_t;
 typedef unsigned __int128 uint128_t;
 
-static EvuDescriptor descriptor(unsigned index) {
-  const uint64_t value = cpu.evu.descriptors[index];
-  return (EvuDescriptor){ .scale_reg = value & 31, .bias_reg = (value >> 5) & 31,
-    .zero = (int32_t)(value >> 10), .shift = (value >> 42) & 63,
-    .output_sew = (value >> 48) & 3, .valid = (value >> 50) & 1 };
-}
-
 static inline uint64_t width_mask(unsigned bits) { return bits == 64 ? UINT64_MAX : ((UINT64_C(1) << bits) - 1); }
 
 static inline int64_t sign_extend(uint64_t value, unsigned bits) {
@@ -284,7 +277,7 @@ static void execute_fp_ew(Decode *s, EvuJob *job, const uint8_t *vs2, const uint
                           uint32_t vlmax) {
   const int fp_type = job->sew == 1 ? FPCALL_W16 : FPCALL_W32;
   for (uint32_t idx = job->vstart; idx < vl; ++idx) {
-    const rtlreg_t rhs = get_element(vs1, idx, job->sew);
+    const rtlreg_t rhs = get_element(vs1, (job->aux & 0x20) ? 0 : idx, job->sew);
     const rtlreg_t lhs = get_element(vs2, idx, job->sew);
     rtlreg_t result = 0;
     switch (job->opcode) {
@@ -405,11 +398,11 @@ static void execute_fp_reduce(Decode *s, EvuJob *job, const uint8_t *vs2, const 
 
 static void execute_permute(EvuJob *job, const uint8_t *vs2, const uint8_t *vs1, uint8_t *output, uint32_t vl,
                             uint32_t vlmax) {
-  const uint64_t offset = get_element(vs1, 0, job->sew);
+  const uint64_t offset = job->opcode == EVU_GATHER_IMM ? job->vs1 : get_element(vs1, 0, job->sew);
   for (uint32_t idx = job->vstart; idx < vl; ++idx) {
     uint64_t result = 0;
-    if (job->opcode == EVU_GATHER) {
-      const uint64_t index = get_element(vs1, idx, job->sew);
+    if (job->opcode == EVU_GATHER || job->opcode == EVU_GATHER_IMM) {
+      const uint64_t index = job->opcode == EVU_GATHER_IMM ? offset : get_element(vs1, idx, job->sew);
       if (index < vlmax)
         result = get_element(vs2, (uint32_t)index, job->sew);
     } else if (job->opcode == EVU_SLIDE_UP) {
@@ -434,67 +427,39 @@ static void execute_exp2(Decode *s, EvuJob *job, const uint8_t *vs2, uint8_t *ou
   fill_tail(output, vl, vlmax, job->sew, evu_current_vtype().vta);
 }
 
-static int32_t read_i32(const uint8_t *group, unsigned idx) {
-  int32_t value;
-  memcpy(&value, group + idx * 4, sizeof(value));
-  return value;
+/* FP probability quantization deliberately rounds multiplication before the
+ * add, matching RVV's separate vfmul/vfadd, then minNum/clamp and RTZ. */
+static void execute_fp_quant_to_cute(EvuJob *job, const uint8_t *input, const uint8_t *scale, uint32_t vl) {
+  const uint_fast8_t saved_flags = softfloat_exceptionFlags;
+  const uint_fast8_t saved_rounding = softfloat_roundingMode;
+  const uint_fast8_t saved_tininess = softfloat_detectTininess;
+  softfloat_exceptionFlags = 0;
+  softfloat_roundingMode = softfloat_round_near_even;
+  softfloat_detectTininess = softfloat_tininess_afterRounding;
+  const float32_t zero = { .v = 0 }, half = { .v = 0x3f000000 }, limit = { .v = 0x42fe0000 };
+  for (unsigned i = 0; i < vl; ++i) {
+    const float32_t a = { .v = (uint32_t)get_element(input, i, 2) };
+    const float32_t b = { .v = (uint32_t)get_element(scale, (job->aux & 0x10) ? 0 : i, 2) };
+    float32_t value = f32_add(f32_mul(a, b), half);
+    // lt_quiet agrees with HardFloat signaling=false (sNaN alone sets NV).
+    if (!(f32_lt_quiet(value, limit) || f32_eq(value, limit))) value = limit;
+    if (f32_lt_quiet(value, zero)) value = zero;
+    job->output[i] = (uint8_t)f32_to_ui32(value, softfloat_round_minMag, true);
+  }
+  job->output_bytes = vl;
+  job->flags = (uint8_t)softfloat_exceptionFlags;
+  job->uses_fp = true;
+  job->writes_cute = true;
+  softfloat_exceptionFlags = saved_flags;
+  softfloat_roundingMode = saved_rounding;
+  softfloat_detectTininess = saved_tininess;
 }
 
-static int32_t saturate_requant(int64_t value, uint8_t output_sew, bool *saturated) {
-  int64_t min = INT32_MIN;
-  int64_t max = INT32_MAX;
-  if (output_sew == 0) {
-    min = INT8_MIN;
-    max = INT8_MAX;
-  } else if (output_sew == 1) {
-    min = INT16_MIN;
-    max = INT16_MAX;
-  }
-  if (value < min) {
-    *saturated = true;
-    return (int32_t)min;
-  }
-  if (value > max) {
-    *saturated = true;
-    return (int32_t)max;
-  }
-  return (int32_t)value;
-}
-
-static void execute_quant_to_cute(EvuJob *job, const uint8_t *input, const uint8_t *scale, const uint8_t *bias,
-                                 uint8_t *output, uint32_t vl) {
-  const EvuDescriptor cfg_value = descriptor(job->aux & (EVU_DESCRIPTORS - 1));
-  const EvuDescriptor *cfg = &cfg_value;
-  if (!cfg->valid)
-    longjmp_exception(EX_II);
-  const uint64_t active_bytes = (uint64_t)vl * (1u << job->sew);
-  const uint32_t words = (uint32_t)((active_bytes + 3) / 4);
-  for (uint32_t idx = job->vstart; idx < words; ++idx) {
-    const int32_t a = read_i32(input, idx);
-    const int32_t sc = read_i32(scale, idx);
-    const int64_t product = (int64_t)(int32_t)((uint32_t)a - (uint32_t)cfg->zero) * sc;
-    const int64_t shifted = (product + read_i32(bias, idx)) >> cfg->shift;
-    bool saturated = false;
-    int32_t result = saturate_requant(shifted, cfg->output_sew, &saturated);
-    job->vxsat |= saturated;
-    result = (int32_t)((uint32_t)result + (uint32_t)cfg->zero);
-    const uint32_t remaining = (uint32_t)active_bytes - idx * 4;
-    memcpy(output + idx * 4, &result, remaining < 4 ? remaining : 4);
-  }
-}
-
+/* Reserved descriptor context slots have no execution consumer. */
 void evu_compute_reset(void) { memset(cpu.evu.descriptors, 0, sizeof(cpu.evu.descriptors)); }
 
 void evu_compute_execute(Decode *s, EvuJob *job) {
   const EvuVType vt = evu_current_vtype();
-  if (job->opcode == EVU_SETCFG) {
-    cpu.evu.descriptors[job->vd & 7] = (UINT64_C(1) << 50) | ((uint64_t)(job->sew & 3) << 48) |
-      ((uint64_t)(job->aux & 63) << 42) | ((uint64_t)(uint32_t)job->base << 10) |
-      ((uint64_t)job->vs2 << 5) | job->vs1;
-    job->updates_vector_state = true;
-    return;
-  }
-
   if (job->opcode == EVU_FENCE || job->opcode == EVU_WAIT || job->opcode == EVU_LAUNCH)
     return;
   const unsigned regs = source_regs(job);
@@ -507,21 +472,13 @@ void evu_compute_execute(Decode *s, EvuJob *job) {
   uint8_t vs2[EVU_MAX_GROUP_BYTES];
   uint8_t vs1[EVU_MAX_GROUP_BYTES];
   read_group(vs2, job->vs2, regs);
-  if (job->opcode != EVU_EXP2) read_group(vs1, job->vs1, reduction ? 1 : regs);
+  if (job->opcode != EVU_EXP2 && job->opcode != EVU_GATHER_IMM)
+    read_group(vs1, job->vs1, reduction ? 1 : regs);
 
-  if (job->opcode == EVU_QUANT_TO_CUTE) {
-    if (vl == 0)
-      return;
-    const EvuDescriptor cfg = descriptor(job->aux & (EVU_DESCRIPTORS - 1));
-    if (!cfg.valid)
-      longjmp_exception(EX_II);
-    uint8_t scale[EVU_MAX_GROUP_BYTES];
-    uint8_t bias[EVU_MAX_GROUP_BYTES];
-    read_group(scale, cfg.scale_reg, regs);
-    read_group(bias, cfg.bias_reg, regs);
-    job->output_bytes = regs * EVU_VLEN_BYTES;
-    execute_quant_to_cute(job, vs2, scale, bias, job->output, vl);
-    job->writes_cute = true;
+  if (job->opcode == EVU_FP_QUANT_TO_CUTE) {
+    uint8_t inverse_scale[EVU_MAX_GROUP_BYTES];
+    read_group(inverse_scale, job->vd, 1);
+    if (vl != 0) execute_fp_quant_to_cute(job, vs2, inverse_scale, vl);
     return;
   }
 
@@ -593,6 +550,7 @@ void evu_compute_execute(Decode *s, EvuJob *job) {
     job->uses_fp = true;
     break;
   case EVU_GATHER:
+  case EVU_GATHER_IMM:
   case EVU_SLIDE_UP:
   case EVU_SLIDE_DOWN:
     execute_permute(job, vs2, vs1, job->output, vl, vlmax);

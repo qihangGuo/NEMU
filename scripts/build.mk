@@ -76,6 +76,16 @@ $(OBJ_DIR)/%.opp: %.cpp
 # Dependencies
 -include $(COBJS:.o=.d) $(XOBJS:.opp=.d)
 
+# fixdep keys dependency rules by the absolute object path. After copying a
+# build tree, those rules still name the old checkout, so header changes can
+# silently leave objects using incompatible CPU_state layouts. Rebuild objects
+# without a dependency rule for this checkout, including objects missing .d files.
+ifdef call_fixdep
+untracked-objs := $(foreach obj,$(OBJS),$(if $(source_$(obj)),,$(obj)))
+.PHONY: force-dependencies
+$(untracked-objs): force-dependencies
+endif
+
 # Some convenient rules
 
 .PHONY: app clean

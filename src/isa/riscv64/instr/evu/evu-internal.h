@@ -62,20 +62,49 @@ enum {
   EVU_SETVL = 0x46,
   EVU_GATHER = 0x47,
   EVU_SCATTER = 0x48,
-  EVU_QUANT_TO_CUTE = 0x4c,
+  EVU_FP_QUANT_TO_CUTE = 0x50,
+  EVU_GATHER_IMM = 0x51,
+  EVU_LOAD_E0 = 0x52,
+  EVU_STORE_E0 = 0x53,
+  EVU_FADD_E0 = 0x54,
+  EVU_FSUB_E0 = 0x55,
+  EVU_FMUL_E0 = 0x56,
+  EVU_FDIV_E0 = 0x57,
+  EVU_FMAX_E0 = 0x58,
+  EVU_EXP2_E0 = 0x59,
+  EVU_FADD_SCALAR = 0x5a,
+  EVU_FSUB_SCALAR = 0x5b,
+  EVU_FMUL_SCALAR = 0x5c,
+  EVU_FMAX_SCALAR = 0x5d,
+  EVU_FP_QUANT_SCALAR = 0x5e,
   /* Retired SETMASK opcode 0x4d remains reserved. */
-  EVU_SETCFG = 0x4e,
+  /* Retired fixed-point QuantToCute (0x4c) and SETCFG (0x4e) are reserved. */
   /* Retired VRF quantization opcode 0x4f remains reserved. */
 };
 
-typedef struct {
-  uint8_t scale_reg;
-  uint8_t bias_reg;
-  int32_t zero;
-  uint8_t shift;
-  uint8_t output_sew;
-  bool valid;
-} EvuDescriptor;
+static inline bool evu_element_zero(uint32_t opcode) {
+  return opcode >= EVU_LOAD_E0 && opcode <= EVU_EXP2_E0;
+}
+static inline bool evu_scalar_source(uint32_t opcode) {
+  return opcode >= EVU_FADD_SCALAR && opcode <= EVU_FMAX_SCALAR;
+}
+static inline bool evu_scalar_form(uint32_t opcode) {
+  return evu_element_zero(opcode) || evu_scalar_source(opcode) || opcode == EVU_FP_QUANT_SCALAR;
+}
+static inline uint32_t evu_canonical_opcode(uint32_t opcode) {
+  switch (opcode) {
+  case EVU_LOAD_E0: return EVU_LOAD;
+  case EVU_STORE_E0: return EVU_STORE;
+  case EVU_FADD_E0: case EVU_FADD_SCALAR: return EVU_FADD;
+  case EVU_FSUB_E0: case EVU_FSUB_SCALAR: return EVU_FSUB;
+  case EVU_FMUL_E0: case EVU_FMUL_SCALAR: return EVU_FMUL;
+  case EVU_FDIV_E0: return EVU_FDIV;
+  case EVU_FMAX_E0: case EVU_FMAX_SCALAR: return EVU_FMAX;
+  case EVU_EXP2_E0: return EVU_EXP2;
+  case EVU_FP_QUANT_SCALAR: return EVU_FP_QUANT_TO_CUTE;
+  default: return opcode;
+  }
+}
 
 typedef struct {
   uint64_t pc;

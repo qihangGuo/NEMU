@@ -6,12 +6,15 @@ CPPFLAGS += -I$(NEMU_HOME)/include
 CPPFLAGS += -I$(NEMU_HOME)/src/isa/riscv64/include
 CPPFLAGS += -I$(NEMU_HOME)/src/isa/riscv64/instr
 
-all: evu_compute_ref_test
+all: evu_compute_ref_test evu_fp_quant_ref_test
 
 evu_compute_ref_test: evu_compute_ref_test.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -ldl -lm
 
+evu_fp_quant_ref_test: evu_fp_quant_ref_test.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -frounding-math -ffp-contract=off $< -o $@ -ldl -lm
+
 clean:
-	rm -f evu_compute_ref_test
+	rm -f evu_compute_ref_test evu_fp_quant_ref_test
 
 .PHONY: all clean

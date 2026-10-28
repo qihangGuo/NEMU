@@ -8,6 +8,9 @@
 #include <softfloat.h>
 #include "../../local-include/csr.h"
 #include "matrix.h"
+#ifdef CONFIG_RV_AME
+#include "../ame/mreg.h"
+#endif
 
 enum { MATRIX_DIM = CONFIG_CUSTOM_EVU_VLEN / 32, MATRIX_K = 64,
        MATRIX_ELEMENTS = MATRIX_DIM * MATRIX_DIM, MATRIX_BYTES = MATRIX_ELEMENTS * 4 };
@@ -16,9 +19,7 @@ static struct {
   bool active, ready, asynchronous, last;
   uint64_t pc, base;
   uint32_t scale_a[MATRIX_DIM], scale_b[MATRIX_DIM];
-  int8_t ab[4][MATRIX_DIM][MATRIX_K];
   uint32_t acc[4][MATRIX_DIM][MATRIX_DIM];
-  unsigned ab_rows[4], ab_cols[4];
   bool acc_valid[4];
   uint8_t zero_mask, load_mask;
   unsigned mma_count;
@@ -28,7 +29,33 @@ static struct {
   uint8_t sticky_flags;
 } matrix;
 
-void evu_matrix_reset(void) { memset(&matrix, 0, sizeof(matrix)); }
+// AB registers are architectural state and survive xv.launch/xv.fence.
+// In particular a quantized P tile is produced before its PV launch.
+static struct {
+  int8_t ab[4][MATRIX_DIM][MATRIX_K];
+  bool valid[4][MATRIX_DIM][MATRIX_K];
+  unsigned ab_rows[4], ab_cols[4];
+} inputs;
+
+void evu_matrix_reset(void) {
+  memset(&matrix, 0, sizeof(matrix));
+  memset(&inputs, 0, sizeof(inputs));
+}
+
+void evu_matrix_cute_byte(unsigned reg, unsigned bank, unsigned entry, unsigned byte, uint8_t value) {
+  const unsigned row = (entry / 2) * 8 + bank;
+  const unsigned col = (entry % 2) * 32 + byte;
+  Assert(reg < 4 && bank < 8 && row < MATRIX_DIM && col < MATRIX_K,
+         "EVU direct CUTE write outside the 128x64 tile");
+  inputs.ab[reg][row][col] = (int8_t)value;
+  inputs.valid[reg][row][col] = true;
+  if (inputs.ab_rows[reg] < row + 1) inputs.ab_rows[reg] = row + 1;
+  if (inputs.ab_cols[reg] < col + 1) inputs.ab_cols[reg] = col + 1;
+#ifdef CONFIG_RV_AME
+  // Apply independently calculated bytes to the ordinary AME reference too.
+  mtreg_l8(reg, row, col) = value;
+#endif
+}
 
 bool evu_matrix_physical_mode(void) {
   bool physical = cpu.mode == MODE_M && satp->mode == 0 &&
@@ -70,14 +97,15 @@ void evu_matrix_load(uint32_t reg, uint64_t base, uint64_t stride,
   Assert(evu_matrix_physical_mode() && reg < 4 && size == 0 && signed_int8 &&
          rows <= MATRIX_DIM && cols <= MATRIX_K,
          "EVU matrix reference supports M/Bare signed INT8 tile loads after launch");
-  matrix.ab_rows[reg] = rows;
-  matrix.ab_cols[reg] = cols;
+  inputs.ab_rows[reg] = rows;
+  inputs.ab_cols[reg] = cols;
   matrix.load_mask |= 1u << reg;
   for (unsigned r = 0; r < rows; ++r) {
     for (unsigned c = 0; c < cols; ++c) {
       uint64_t address = base + (transpose ? c * stride + r : r * stride + c);
       Assert(address >= base && in_pmem(address), "EVU matrix input is outside physical RAM");
-      memcpy(&matrix.ab[reg][r][c], guest_to_host(address), 1);
+      memcpy(&inputs.ab[reg][r][c], guest_to_host(address), 1);
+      inputs.valid[reg][r][c] = true;
     }
   }
 }
@@ -95,9 +123,9 @@ void evu_matrix_mma(uint32_t dest, uint32_t src1, uint32_t src2,
   Assert(!matrix.ready && evu_matrix_physical_mode() && signed_int8_int32 &&
          dest >= 4 && dest < 8 && src1 < 4 && src2 < 4 &&
          rows == MATRIX_DIM && cols == MATRIX_DIM && depth <= MATRIX_K &&
-         matrix.acc_valid[dest - 4] && matrix.ab_rows[src1] >= rows &&
-         matrix.ab_rows[src2] >= cols && matrix.ab_cols[src1] >= depth &&
-         matrix.ab_cols[src2] >= depth,
+         matrix.acc_valid[dest - 4] && inputs.ab_rows[src1] >= rows &&
+         inputs.ab_rows[src2] >= cols && inputs.ab_cols[src1] >= depth &&
+         inputs.ab_cols[src2] >= depth,
          "EVU reference supports one full INT8->INT32 MMA with fresh mzero/loads per FP32 launch");
   ++matrix.mma_count;
   // Compute independently of SHARE_REF's lazy adoption of DUT matrix results.
@@ -105,7 +133,9 @@ void evu_matrix_mma(uint32_t dest, uint32_t src1, uint32_t src2,
     for (unsigned c = 0; c < cols; ++c) {
       uint32_t value = matrix.acc[dest - 4][r][c];
       for (unsigned k = 0; k < depth; ++k) {
-        int32_t product = (int32_t)matrix.ab[src1][r][k] * matrix.ab[src2][c][k];
+        Assert(inputs.valid[src1][r][k] && inputs.valid[src2][c][k],
+                 "EVU matrix reference read an undefined direct input byte");
+        int32_t product = (int32_t)inputs.ab[src1][r][k] * inputs.ab[src2][c][k];
         if (saturate) {
           int64_t sum = (int64_t)signed_word(value) + product;
           value = sum > INT32_MAX ? INT32_MAX : sum < INT32_MIN ? (uint32_t)INT32_MIN : (uint32_t)sum;

@@ -92,6 +92,115 @@ static int8_t sat8(int value) {
   return (int8_t)value;
 }
 
+static void check_scalar_fp_forms(void) {
+  uint64_t saved[4096];
+  copy_csrs(saved, false);
+  const uint64_t config = (UINT64_C(1) << 40) | (UINT64_C(16) << 32);
+  uint32_t input[VLEN_BYTES / 4], scale[VLEN_BYTES / 4], seed[VLEN_BYTES / 4], actual[VLEN_BYTES / 4];
+  for (unsigned i = 0; i < VLEN_BYTES / 4; ++i) {
+    input[i] = float_bits((float)(i + 1));
+    scale[i] = i ? UINT32_C(0x7f800001) : float_bits(2.0f);
+    seed[i] = float_bits(4.0f);
+  }
+  copy_mem(UINT64_C(0x80072000), input, sizeof(input), true);
+  copy_mem(UINT64_C(0x80072400), scale, sizeof(scale), true);
+  copy_mem(UINT64_C(0x80072800), seed, sizeof(seed), true);
+  write_evu_csr(0x8c0, config | (VLEN_BYTES / 4));
+  load_reg(8, UINT64_C(0x80072000), 2);
+  load_reg(9, UINT64_C(0x80072400), 2);
+  load_reg(10, UINT64_C(0x80072800), 2);
+  load_reg(11, UINT64_C(0x80072800), 2);
+  write_evu_csr(0x8c0, config | 64);
+  // Inactive scalar-source lanes contain sNaNs; they must not contribute flags.
+  evu(insn(0x5c, 2, 10, 9, 8), 0, 0);
+  read_reg(10, actual);
+  for (unsigned i = 0; i < VLEN_BYTES / 4; ++i)
+    CHECK(actual[i] == (i < 64 ? float_bits(2.0f * (float)(i + 1)) : seed[i]));
+  evu(insn(0x5c, 2, 9, 9, 8), 0, 0); // Scalar source aliases the destination.
+  read_reg(9, actual);
+  for (unsigned i = 0; i < VLEN_BYTES / 4; ++i)
+    CHECK(actual[i] == (i < 64 ? float_bits(2.0f * (float)(i + 1)) : scale[i]));
+  evu(insn(0x52, 2, 11, 10, 0), UINT64_C(0x80072000), 0);
+  evu(insn(0x54, 2, 11, 8, 11), 0, 0);
+  read_reg(11, actual);
+  CHECK(actual[0] == float_bits(2.0f));
+  for (unsigned i = 1; i < VLEN_BYTES / 4; ++i) CHECK(actual[i] == seed[i]);
+  uint8_t guard[64], stored[64];
+  memset(guard, 0xa5, sizeof(guard));
+  memcpy(guard + 20, actual, 4);
+  memset(stored, 0xa5, sizeof(stored));
+  copy_mem(UINT64_C(0x80072c00), stored, sizeof(stored), true);
+  const uint32_t store = insn(0x53, 2, 11, 10, 0);
+  const uint64_t pc = run(store, UINT64_C(0x80072c14));
+  CHECK(store_event(UINT64_C(0x80072c00), guard, UINT64_C(15) << 20) == 0);
+  CHECK(complete(pc, store, 0, false, 0) == 0);
+  copy_mem(UINT64_C(0x80072c00), stored, sizeof(stored), false);
+  CHECK(memcmp(guard, stored, sizeof(guard)) == 0);
+  uint64_t state[21];
+  CHECK(get_csr(state, sizeof(state)) == 0);
+  CHECK(state[0] == 64 && state[1] == 16);
+  write_evu_csr(0x8c0, config); // VL=0: scalar arithmetic remains inactive.
+  evu(insn(0x54, 2, 11, 8, 11), 0, 0);
+  uint32_t after[VLEN_BYTES / 4];
+  read_reg(11, after);
+  CHECK(memcmp(actual, after, sizeof(after)) == 0);
+  write_evu_csr(0x8c0, saved[0x8c0]);
+  CHECK(pending() == 0);
+  printf("EVU scalar FP32: source capture, aliases, tails, E0 load/store guards and VL preservation passed\n");
+}
+
+static void check_gather_imm(void) {
+  uint64_t saved[4096];
+  copy_csrs(saved, false);
+  const uint64_t enabled = UINT64_C(1) << 40;
+  uint8_t source[VLEN_BYTES], sentinel[VLEN_BYTES], actual[VLEN_BYTES], expected[VLEN_BYTES];
+  memset(sentinel, 0xa5, sizeof(sentinel));
+  const unsigned indices[] = {0, 7, 16, 31};
+  const unsigned lengths[] = {0, 1, 13, 64};
+  for (unsigned sew = 0; sew <= 2; ++sew) {
+    const unsigned bytes = 1u << sew;
+    const unsigned vlmax = VLEN_BYTES / bytes;
+    const uint64_t config = enabled | ((uint64_t)(sew << 3) << 32);
+    for (unsigned i = 0; i < sizeof(source); ++i) source[i] = (uint8_t)(i * 37 + (i >> 5) + 19);
+    copy_mem(UINT64_C(0x80070000), source, sizeof(source), true);
+    copy_mem(UINT64_C(0x80070400), sentinel, sizeof(sentinel), true);
+    for (unsigned alias = 0; alias < 2; ++alias) {
+      const unsigned dest = alias ? 8 : 16;
+      for (unsigned n = 0; n < sizeof(indices) / sizeof(indices[0]); ++n) {
+        for (unsigned v = 0; v < sizeof(lengths) / sizeof(lengths[0]); ++v) {
+          const unsigned index = indices[n], vl = lengths[v];
+          write_evu_csr(0x8c0, config | vlmax);
+          load_reg(8, UINT64_C(0x80070000), sew);
+          if (!alias) load_reg(dest, UINT64_C(0x80070400), sew);
+          write_evu_csr(0x8c0, config | vl);
+          memcpy(expected, alias ? source : sentinel, sizeof(expected));
+          for (unsigned lane = 0; lane < vl; ++lane)
+            memcpy(expected + lane * bytes, source + index * bytes, bytes);
+          evu(insn(0x51, sew, dest, index, 8), 0, 0);
+          read_reg(dest, actual);
+          CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+          if (!alias) {
+            read_reg(8, actual);
+            CHECK(memcmp(actual, source, sizeof(actual)) == 0);
+          }
+        }
+      }
+    }
+  }
+  // Fractional LMUL can make an unsigned immediate exceed VLMAX.
+  write_evu_csr(0x8c0, enabled | (UINT64_C(0x10) << 32) | (VLEN_BYTES / 4));
+  load_reg(8, UINT64_C(0x80070000), 2);
+  write_evu_csr(0x8c0, enabled | (UINT64_C(0x15) << 32) | 13);
+  evu(insn(0x51, 2, 8, 31, 8), 0, 0);
+  read_reg(8, actual);
+  memset(expected, 0, 13 * 4);
+  memcpy(expected + 13 * 4, source + 13 * 4, sizeof(expected) - 13 * 4);
+  CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+  write_evu_csr(0x8c0, saved[0x8c0]);
+  CHECK(pending() == 0);
+  printf("EVU immediate gather: 3 widths, unsigned indices, VL=0/tails, aliases and out-of-range indices passed\n");
+}
+
 /* Mirror vector_add_evu_test.c without compiling a RISC-V workload. Keep the
  * entire instruction burst pending to exercise forwarding and store snapshots. */
 static void check_vector_add_sequence(void) {
@@ -757,8 +866,10 @@ int main(int argc, char **argv) {
   } while (0)
   void (*init)(void);
   void (*ram_size)(size_t);
+  void (*sync_interrupts)(void *);
   SYMBOL(init, "difftest_init");
   SYMBOL(ram_size, "difftest_set_ramsize");
+  SYMBOL(sync_interrupts, "difftest_non_reg_interrupt_pending");
   SYMBOL(copy_mem, "difftest_memcpy");
   SYMBOL(copy_regs, "difftest_regcpy");
   SYMBOL(copy_csrs, "difftest_csrcpy");
@@ -774,6 +885,12 @@ int main(int argc, char **argv) {
 
   ram_size(64 * 1024 * 1024);
   init();
+  // EMU synchronizes pending interrupts before the first guest instruction.
+  // Copied objects with stale CPU_state layouts used to crash here in AIA.
+  struct NonRegInterruptPending no_interrupts = {0};
+  for (unsigned i = 0; i < 20; ++i)
+    sync_interrupts(&no_interrupts);
+  printf("NEMU pre-commit interrupt synchronization passed\n");
   memset(&initial, 0, sizeof(initial));
   copy_regs(&initial, false);
   initial.mode = 3;
@@ -792,6 +909,8 @@ int main(int argc, char **argv) {
   set_async(true);
   check_vector_add_sequence();
   check_maximum_group_memory();
+  check_gather_imm();
+  check_scalar_fp_forms();
 
   uint8_t lhs8[VLEN_BYTES], rhs8[VLEN_BYTES], result8[VLEN_BYTES];
   for (unsigned i = 0; i < VLEN_BYTES; ++i) {
@@ -1005,30 +1124,6 @@ int main(int argc, char **argv) {
   for (unsigned i = 0; i < VLEN_BYTES / 4; ++i)
     CHECK(result32[i] == (i < 5 ? 0xdead0000u + i : lhs32[i - 5]));
 
-  int32_t quant_input[VLEN_BYTES / 4], quant_scale[VLEN_BYTES / 4], quant_bias[VLEN_BYTES / 4];
-  for (unsigned i = 0; i < VLEN_BYTES / 4; ++i) {
-    quant_input[i] = (int32_t)(i % 31) - 15;
-    quant_scale[i] = 2;
-    quant_bias[i] = 1;
-  }
-  copy_mem(UINT64_C(0x80011800), quant_scale, sizeof(quant_scale), true);
-  copy_mem(UINT64_C(0x80011c00), quant_bias, sizeof(quant_bias), true);
-  copy_mem(UINT64_C(0x80012000), quant_input, sizeof(quant_input), true);
-  load_reg(14, UINT64_C(0x80011800), 2);
-  load_reg(15, UINT64_C(0x80011c00), 2);
-  load_reg(16, UINT64_C(0x80012000), 2);
-  evu(insn(0x46, 2, 0, 10, 0), 0, 0);
-  evu(insn(0x4c, 2, 17, 0, 16), 0, 0); // VL=0 does not require a descriptor.
-  evu(insn(0x46, 2, 0, 10, 0), VLEN_BYTES / 4, 0);
-  evu(insn(0x4e, 2, 0, 14, 15), 0, 0);
-  uint8_t before_quant[VLEN_BYTES];
-  read_reg(17, before_quant);
-  evu(insn(0x4c, 2, 17, 0, 16), 0, 0);
-  read_reg(17, result32);
-  CHECK(memcmp(result32, before_quant, sizeof(before_quant)) == 0);
-  read_reg(16, result32);
-  CHECK(memcmp(result32, quant_input, sizeof(quant_input)) == 0);
-
   uint8_t tail_marker[VLEN_BYTES];
   evu(insn(0x46, 0, 0, 10, 0), VLEN_BYTES, 0);
   for (unsigned i = 0; i < VLEN_BYTES; ++i)
@@ -1063,37 +1158,6 @@ int main(int argc, char **argv) {
   for (unsigned i = 64; i < VLEN_BYTES; ++i)
     CHECK(result8[i] == tail_marker[i]);
 
-  const unsigned quant_tail_bytes[] = {0, 1, 2, 3, 4, 30, 31, 32, 33, 34, 35, 36, 60, 62, 63, 64, VLEN_BYTES};
-  for (unsigned sew = 0; sew < 3; ++sew) {
-    for (unsigned t = 0; t < sizeof(quant_tail_bytes) / sizeof(quant_tail_bytes[0]); ++t) {
-      const unsigned bytes = quant_tail_bytes[t];
-      if (bytes % (1u << sew))
-        continue;
-      evu(insn(0x46, 0, 0, 10, 0), VLEN_BYTES, 0);
-      load_reg(22, UINT64_C(0x80012400), 0);
-      evu(insn(0x46, sew, 0, 10, 0), bytes >> sew, 0);
-      evu(insn(0x4c, sew, 22, 0, 16), 0, 0);
-      read_reg(22, result8);
-      CHECK(memcmp(result8, tail_marker, VLEN_BYTES) == 0);
-    }
-  }
-  printf("EVU QuantToCute: VRF preserved for byte/halfword/word extents and zero VL\n");
-  for (unsigned i = 0; i < VLEN_BYTES / 4; ++i)
-    quant_input[i] = i < 9 ? 1 : 1000;
-  copy_mem(UINT64_C(0x80012000), quant_input, sizeof(quant_input), true);
-  load_reg(16, UINT64_C(0x80012000), 2);
-  evu(insn(0x4e, 0, 0, 14, 15), 0, 0); // Clamp each output word to the INT8 range.
-  copy_csrs(csrs, false);
-  csrs[0x8c2] = csrs[0x009] = csrs[0x00f] = 0;
-  copy_csrs(csrs, true);
-  evu(insn(0x46, 2, 0, 10, 0), 9, 0);
-  evu(insn(0x4c, 2, 22, 0, 16), 0, 0);
-  copy_csrs(csrs, false);
-  CHECK((csrs[0x8c2] & 1) == 0 && (csrs[0x009] & 1) == 0); // Inactive saturated words cannot set VXSAT.
-  evu(insn(0x46, 2, 0, 10, 0), 10, 0);
-  evu(insn(0x4c, 2, 22, 0, 16), 0, 0);
-  copy_csrs(csrs, false);
-  CHECK((csrs[0x8c2] & 1) == 1 && (csrs[0x009] & 1) == 0);
   // The retired-opcode checks below compare v0 against this committed image.
   read_reg(0, result8);
 
@@ -1104,15 +1168,18 @@ int main(int argc, char **argv) {
   CHECK(invalid.mcause == 2 && pending() == 0);
   invalid = run_raw(insn(0x39, 2, 0, 0, 0), 0);
   CHECK(invalid.mcause == 2 && pending() == 0);
-  const unsigned retired[] = {0x09, 0x0b, 0x38, 0x4d, 0x4f};
-  for (unsigned op = 0; op < sizeof(retired) / sizeof(retired[0]); ++op)
-    for (unsigned sew = 0; sew < 8; ++sew) {
-      invalid = run_raw(insn(retired[op], sew, 0, 1, 0), 0);
-      CHECK(invalid.mcause == 2 && pending() == 0);
-      uint8_t mask_after_invalid[VLEN_BYTES];
-      read_reg(0, mask_after_invalid);
-      CHECK(memcmp(mask_after_invalid, result8, sizeof(result8)) == 0);
-    }
+  const unsigned retired[] = {0x09, 0x0b, 0x38, 0x4c, 0x4d, 0x4e, 0x4f};
+  for (unsigned vl_case = 0; vl_case < 2; ++vl_case) {
+    write_evu_csr(0x8c0, (UINT64_C(1) << 40) | (UINT64_C(16) << 32) | (vl_case ? 9 : 0));
+    for (unsigned op = 0; op < sizeof(retired) / sizeof(retired[0]); ++op)
+      for (unsigned sew = 0; sew < 8; ++sew) {
+        invalid = run_raw(insn(retired[op], sew, 0, 1, 0), 0);
+        CHECK(invalid.mcause == 2 && pending() == 0);
+        uint8_t mask_after_invalid[VLEN_BYTES];
+        read_reg(0, mask_after_invalid);
+        CHECK(memcmp(mask_after_invalid, result8, sizeof(result8)) == 0);
+      }
+  }
 
   check_unordered_reductions();
   check_fp_flags_with_scalar_history();
@@ -1123,7 +1190,7 @@ int main(int argc, char **argv) {
       check_softmax_dut_trace(argv[3], scalar_flags[i]);
   }
   check_csr_isolation();
-  printf("EVU compute: integer/FP, reduction, Exp2, QuantToCute, VL state and retired opcodes passed\n");
+  printf("EVU compute: integer/FP, reduction, Exp2, VL state and retired opcodes passed\n");
   dlclose(library);
   return 0;
 }

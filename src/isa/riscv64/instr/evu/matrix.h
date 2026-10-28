@@ -13,5 +13,6 @@ uint8_t evu_matrix_take_flags(void);
 bool evu_matrix_owns(uint64_t address);
 int evu_matrix_store(uint64_t address, const void *data, uint64_t mask);
 int evu_matrix_drain(void);
+void evu_matrix_cute_byte(unsigned reg, unsigned bank, unsigned entry, unsigned byte, uint8_t value);
 
 #endif
