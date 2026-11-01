@@ -12,16 +12,34 @@
 #include <memory/vaddr.h>
 #include <softfloat.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 _Static_assert(CONFIG_CUSTOM_EVU_VLEN % 512 == 0, "EVU requires complete 64-byte packets");
 _Static_assert(CONFIG_CUSTOM_EVU_DLEN % 64 == 0 && CONFIG_CUSTOM_EVU_VLEN % CONFIG_CUSTOM_EVU_DLEN == 0,
                "EVU DLEN must divide VLEN and contain complete beats");
 
-static EvuJob jobs[EVU_QUEUE];
+static EvuJob *jobs;
+static unsigned capacity;
 static unsigned head, count;
 static bool asynchronous;
 static uint32_t defined_registers;
+
+/* CPU retirement can run ahead of EVU dispatch, not just its active job slots.
+ * Grow the reference-only queue without changing guest timing or completion. */
+static void reserve_job(void) {
+  if (count < capacity) return;
+  const unsigned next = capacity ? capacity * 2 : EVU_QUEUE;
+  Assert(next > capacity, "EVU reference queue size overflow");
+  EvuJob *expanded = calloc(next, sizeof(*expanded));
+  Assert(expanded != NULL, "Cannot allocate EVU reference queue (%u jobs)", next);
+  for (unsigned i = 0; i < count; ++i)
+    expanded[i] = jobs[(head + i) % capacity];
+  free(jobs);
+  jobs = expanded;
+  capacity = next;
+  head = 0;
+}
 
 static const uint16_t evu_csr_addresses[] = {
   0x8c0, 0x8c1, 0x8c2, 0x8d0, 0x8d1, 0x8d2, 0x8d3, 0x8d4, 0x8d5, 0x8d6, 0x8d7,
@@ -160,8 +178,9 @@ static uint32_t write_group_mask(uint8_t regs) {
 void evu_compute_reset(void);
 
 void evu_reset(void) {
-  memset(jobs, 0, sizeof(jobs));
   head = count = 0;
+  reserve_job();
+  memset(jobs, 0, capacity * sizeof(*jobs));
   asynchronous = false;
   defined_registers = 0;
   memset(&cpu.evu, 0, sizeof(cpu.evu));
@@ -186,7 +205,7 @@ void evu_read_register(uint32_t reg, void *data) {
   // oldest to newest so chaining and in-place operations observe the same data
   // as the ordered RTL completion stream.
   for (unsigned i = 0; i < count; ++i) {
-    overlay_job_register(&jobs[(head + i) % EVU_QUEUE], reg, data);
+    overlay_job_register(&jobs[(head + i) % capacity], reg, data);
   }
 }
 
@@ -301,6 +320,28 @@ static void execute_memory(EvuJob *job) {
   if (job->opcode == EVU_LOAD) {
     for (uint32_t i = job->vstart; i < job->vl; ++i) {
       memcpy(job->output + (size_t)i * element_bytes, guest_to_host(job->physical[i]), element_bytes);
+    }
+    /* Forward pending stores in program order, grouping contiguous physical
+     * runs so large loads do not require an element-by-element cross product. */
+    for (unsigned q = 0; q < count; ++q) {
+      const EvuJob *older = &jobs[(head + q) % capacity];
+      if (!older->writes_memory || older->cause) continue;
+      const unsigned width = 1u << older->sew;
+      for (uint32_t i = job->vstart, next; i < job->vl; i = next) {
+        for (next = i + 1; next < job->vl &&
+             job->physical[next] == job->physical[next - 1] + element_bytes; ++next) {}
+        const uint64_t lo = job->physical[i], hi = lo + (next - i) * element_bytes;
+        for (uint32_t e = older->vstart, end; e < older->vl; e = end) {
+          for (end = e + 1; end < older->vl &&
+               older->physical[end] == older->physical[end - 1] + width; ++end) {}
+          const uint64_t start = lo > older->physical[e] ? lo : older->physical[e];
+          const uint64_t limit = older->physical[e] + (end - e) * width;
+          const uint64_t finish = hi < limit ? hi : limit;
+          if (start < finish)
+            memcpy(job->output + (size_t)i * element_bytes + start - lo,
+                   older->output + (size_t)e * width + start - older->physical[e], finish - start);
+        }
+      }
     }
   }
 }
@@ -422,9 +463,9 @@ void evu_execute(Decode *s, uint32_t instr, uint64_t base) {
   if (opcode == EVU_FP_QUANT_TO_CUTE &&
       (base >> 9 || evu_current_vl(2) > 64 || CONFIG_CUSTOM_EVU_DLEN != 256))
     longjmp_exception(EX_II);
-  Assert(count < EVU_QUEUE, "EVU reference command queue overflow");
+  reserve_job();
 
-  EvuJob *job = &jobs[(head + count) % EVU_QUEUE];
+  EvuJob *job = &jobs[(head + count) % capacity];
   memset(job, 0, sizeof(*job));
   job->pc = s->pc;
   job->instr = instr;
@@ -522,48 +563,49 @@ int difftest_evu_get_csr(void *data, size_t bytes) {
 int difftest_evu_store(uint64_t addr, const void *data, uint64_t mask) {
   if (evu_matrix_owns(addr))
     return evu_matrix_store(addr, data, mask);
-  EvuJob *job = NULL;
-  for (unsigned i = 0; i < count; ++i) {
-    EvuJob *candidate = &jobs[(head + i) % EVU_QUEUE];
-    if (candidate->writes_memory) {
-      job = candidate;
-      break;
-    }
-  }
-  if (!job || job->cause || mask != UINT64_MAX || (addr & 63) || !in_pmem(addr) || !in_pmem(addr + 63)) {
+  if (!mask || (addr & 63) || !in_pmem(addr) || !in_pmem(addr + 63)) {
     fprintf(stderr, "EVU store order/address/mask mismatch at 0x%lx mask=0x%lx\n", addr, mask);
     return 1;
   }
 
-  const unsigned element_bytes = 1u << job->sew;
   uint8_t expected[64];
   memcpy(expected, guest_to_host(addr), sizeof(expected));
-  bool intersects = false;
-  for (unsigned byte = 0; byte < 64; ++byte) {
-    for (uint32_t i = job->vstart; i < job->vl; ++i) {
-      if (addr + byte < job->physical[i] || addr + byte >= job->physical[i] + element_bytes)
-        continue;
-      const unsigned index = i * element_bytes + addr + byte - job->physical[i];
-      const uint8_t value = job->output[index];
-      const uint8_t actual = ((const uint8_t *)data)[byte];
-      intersects = true;
-      if (job->observed[index] || actual == value)
-        expected[byte] = value;
+  EvuJob *owner[64] = {0};
+  unsigned index[64] = {0};
+  /* A physical line can cover disjoint bytes from several logical stores.
+   * For each byte only the oldest still-unobserved writer is eligible. */
+  for (unsigned q = 0; q < count; ++q) {
+    EvuJob *job = &jobs[(head + q) % capacity];
+    if (!job->writes_memory || job->cause) continue;
+    const unsigned width = 1u << job->sew;
+    for (uint32_t e = job->vstart; e < job->vl; ++e) {
+      for (unsigned b = 0; b < width; ++b) {
+        const uint64_t pa = job->physical[e] + b;
+        const unsigned at = e * width + b;
+        if (pa < addr || pa >= addr + 64 || !(mask & (UINT64_C(1) << (pa - addr))) ||
+            job->observed[at] || owner[pa - addr]) continue;
+        const unsigned byte = pa - addr;
+        owner[byte] = job;
+        index[byte] = at;
+        expected[byte] = job->output[at];
+      }
     }
   }
-  if (!intersects || memcmp(data, expected, sizeof(expected))) {
-    fprintf(stderr, "EVU physical store/guard mismatch at pc=0x%lx addr=0x%lx\n", job->pc, addr);
+  for (unsigned byte = 0; byte < 64; ++byte) {
+    if ((mask & (UINT64_C(1) << byte)) && !owner[byte]) {
+      fprintf(stderr, "EVU store byte has no pending owner at 0x%lx\n", addr + byte);
+      return 1;
+    }
+  }
+  if (memcmp(data, expected, sizeof(expected))) {
+    fprintf(stderr, "EVU physical store/guard mismatch at addr=0x%lx\n", addr);
     return 1;
   }
-  for (uint32_t i = job->vstart; i < job->vl; ++i) {
-    for (unsigned byte = 0; byte < element_bytes; ++byte) {
-      const uint64_t pa = job->physical[i] + byte;
-      const unsigned index = i * element_bytes + byte;
-      if (pa >= addr && pa < addr + 64 && !job->observed[index] &&
-          ((const uint8_t *)data)[pa - addr] == job->output[index]) {
-        job->observed[index] = 1;
-        ++job->written;
-      }
+  for (unsigned byte = 0; byte < 64; ++byte) {
+    EvuJob *job = owner[byte];
+    if (job) {
+      job->observed[index[byte]] = 1;
+      ++job->written;
     }
   }
   memcpy(guest_to_host(addr), expected, sizeof(expected));
@@ -574,7 +616,7 @@ int difftest_evu_cute_write(uint32_t reg, uint32_t bank, uint32_t entry,
                              const void *data, size_t bytes, uint64_t mask) {
   EvuJob *job = NULL;
   for (unsigned i = 0; i < count; ++i) {
-    EvuJob *candidate = &jobs[(head + i) % EVU_QUEUE];
+    EvuJob *candidate = &jobs[(head + i) % capacity];
     if (candidate->writes_cute && candidate->written < candidate->output_bytes) {
       job = candidate;
       break;
@@ -630,7 +672,7 @@ int difftest_evu_complete(uint64_t pc, uint32_t instr, uint8_t flags, bool excep
       }
   }
   evu_publish_completion_flags(job);
-  head = (head + 1) % EVU_QUEUE;
+  head = (head + 1) % capacity;
   --count;
   return 0;
 }
@@ -653,7 +695,7 @@ int difftest_evu_drain(uint8_t flags, bool exception, uint8_t cause, uint64_t pc
 int difftest_evu_inject_fault(uint64_t pc, uint8_t cause, uint64_t address, bool valid) {
   if (cause == 0 || cause > 15) return 1;
   for (unsigned i = 0; i < count; ++i) {
-    EvuJob *job = &jobs[(head + i) % EVU_QUEUE];
+    EvuJob *job = &jobs[(head + i) % capacity];
     if (job->pc != pc || (job->opcode != EVU_LOAD && job->opcode != EVU_STORE)) continue;
     job->cause = cause;
     job->fault_address = address;

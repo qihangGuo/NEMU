@@ -268,6 +268,58 @@ static void check_vector_add_sequence(void) {
   printf("EVU vector-add reference: 3 widths x 3 rounds, pending aliases, stores, guards and snapshots passed\n");
 }
 
+static void check_memory_window(void) {
+  enum { JOBS = 320, PREFIX = 37 };
+  uint64_t pcs[JOBS], saved[4096];
+  copy_csrs(saved, false);
+  CHECK(pending() == 0);
+  const uint64_t config = (UINT64_C(1) << 40) | (UINT64_C(16) << 32);
+  write_evu_csr(0x8c0, config | 1);
+  const uint32_t add = insn(0x01, 2, 8, 8, 8);
+  for (unsigned i = 0; i < 60; ++i) pcs[i] = run(add, 0);
+  for (unsigned i = 0; i < PREFIX; ++i) CHECK(complete(pcs[i], add, 0, false, 0) == 0);
+  for (unsigned i = 60; i < JOBS; ++i) pcs[i] = run(add, 0);
+  CHECK(pending() == JOBS - PREFIX);
+  for (unsigned i = PREFIX; i < JOBS; ++i) CHECK(complete(pcs[i], add, 0, false, 0) == 0);
+  CHECK(pending() == 0);
+
+  uint8_t line[64], actual[VLEN_BYTES], bad[64];
+  memset(line, 0xa5, sizeof(line));
+  const uint64_t address = UINT64_C(0x80075000);
+  uint32_t a = 0x12345678, b = 0x23456789;
+  copy_mem(address, line, sizeof(line), true);
+  copy_mem(address + 64, &a, sizeof(a), true);
+  copy_mem(address + 68, &b, sizeof(b), true);
+  load_reg(8, address + 64, 2);
+  load_reg(9, address + 68, 2);
+  const uint32_t storeA = insn(0x53, 2, 8, 10, 0), storeB = insn(0x53, 2, 9, 10, 0);
+  const uint32_t load = insn(0x52, 2, 10, 10, 0);
+  const uint64_t pa = run(storeA, address), pb = run(storeB, address + 4);
+  const uint64_t pl = run(load, address); // Reference forwards an unacknowledged store.
+  memcpy(line, &a, 4);
+  memcpy(line + 4, &b, 4);
+  memcpy(bad, line, 64);
+  bad[4] ^= 1;
+  CHECK(store_event(address, bad, UINT64_C(255)) != 0);
+  CHECK(store_event(address, line, UINT64_C(255)) == 0);
+  CHECK(complete(pa, storeA, 0, false, 0) == 0);
+  CHECK(complete(pb, storeB, 0, false, 0) == 0);
+  CHECK(complete(pl, load, 0, false, 0) == 0);
+  read_reg(10, actual);
+  CHECK(memcmp(actual, &a, 4) == 0);
+
+  // Equal-valued later writes must not be mistaken for an earlier physical Ack.
+  const uint64_t p0 = run(storeA, address), p1 = run(storeA, address);
+  CHECK(store_event(address, line, UINT64_C(15)) == 0);
+  CHECK(complete(p0, storeA, 0, false, 0) == 0);
+  CHECK(complete(p1, storeA, 0, false, 0) != 0);
+  CHECK(store_event(address, line, UINT64_C(15)) == 0);
+  CHECK(complete(p1, storeA, 0, false, 0) == 0);
+  CHECK(pending() == 0);
+  copy_csrs(saved, true);
+  printf("EVU memory window: wrapped queue growth, merged ownership, guards, RAW forwarding and repeated writes passed\n");
+}
+
 static void check_maximum_group_memory(void) {
   enum { GROUP_BYTES = 8 * VLEN_BYTES, GUARD = 64 };
   uint8_t input[GROUP_BYTES], output[GROUP_BYTES + 2 * GUARD], actual[sizeof(output)];
@@ -294,13 +346,15 @@ static void check_maximum_group_memory(void) {
     for (uint64_t line = target & ~UINT64_C(63); line < target + GROUP_BYTES; line += 64) {
       uint8_t data[64];
       copy_mem(line, data, sizeof(data), false);
+      uint64_t mask = 0;
       for (unsigned b = 0; b < 64; ++b) {
         if (line + b >= target && line + b < target + GROUP_BYTES) {
           data[b] = input[line + b - target];
+          mask |= UINT64_C(1) << b;
         }
       }
-      // HBL2 exposes a full-line RMW store; inactive bytes must be preserved.
-      CHECK(store_event(line, data, UINT64_MAX) == 0);
+      // HBL2 sends a full-line RMW; the event retains logical byte ownership.
+      CHECK(store_event(line, data, mask) == 0);
     }
     CHECK(complete(pc, store, 0, false, 0) == 0 && pending() == 0);
     memcpy(output + GUARD, input, sizeof(input));
@@ -911,6 +965,7 @@ int main(int argc, char **argv) {
   check_maximum_group_memory();
   check_gather_imm();
   check_scalar_fp_forms();
+  check_memory_window();
 
   uint8_t lhs8[VLEN_BYTES], rhs8[VLEN_BYTES], result8[VLEN_BYTES];
   for (unsigned i = 0; i < VLEN_BYTES; ++i) {
