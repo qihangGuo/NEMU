@@ -162,9 +162,9 @@ config CUSTOM_EVU_VLEN
   range 512 4096
 
 config CUSTOM_EVU_DLEN
-  int "External vector special-path datapath width in bits"
+  int "External vector datapath width in bits"
   depends on CUSTOM_EVU
-  default 256
+  default 512
   range 64 1024
 
 config CUSTOM_TENSOR

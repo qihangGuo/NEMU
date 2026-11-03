@@ -199,17 +199,19 @@ static int matrix_reject(const char *reason, uint32_t row, uint32_t col,
     fprintf(stderr, " %08x", value);
   }
   fprintf(stderr, "\n");
-  if (!matrix.ready || row >= MATRIX_DIM || col >= MATRIX_DIM || lanes > MATRIX_DIM - col) return 1;
+  if (!matrix.ready || row >= MATRIX_DIM || col >= MATRIX_DIM) return 1;
+  const unsigned active = lanes < 8 ? lanes : 8;
+  if (active > MATRIX_DIM - col) return 1;
   const unsigned start = row * MATRIX_DIM + col;
   uint8_t expected_flags = 0;
   fprintf(stderr, "  REF FP32 bits:");
-  for (unsigned lane = 0; lane < lanes; ++lane) {
+  for (unsigned lane = 0; lane < active; ++lane) {
     fprintf(stderr, " %08x", matrix.output[start + lane]);
     expected_flags |= matrix.flags[start + lane];
   }
   fprintf(stderr, "\n  REF mask=0x%lx flags=0x%x last=%d\n",
-          (UINT64_C(1) << lanes) - 1, expected_flags,
-          matrix.processed_count + lanes == MATRIX_ELEMENTS);
+          (UINT64_C(1) << active) - 1, expected_flags,
+          matrix.processed_count + active == MATRIX_ELEMENTS);
   return 1;
 }
 
@@ -219,25 +221,28 @@ int difftest_evu_matrix(uint32_t row, uint32_t col, const void *data, size_t byt
   if (!matrix.active) return MATRIX_REJECT("inactive");
   if (!matrix.ready) return MATRIX_REJECT("not-ready");
   if (!data || !bytes || bytes % 4 || bytes > 64) return MATRIX_REJECT("data-size");
-  if (row >= MATRIX_DIM || col >= MATRIX_DIM || bytes / 4 > MATRIX_DIM - col)
+  if (row >= MATRIX_DIM || col >= MATRIX_DIM)
     return MATRIX_REJECT("coordinates");
   const unsigned lanes = bytes / 4;
-  if ((lanes & (lanes - 1)) || col % lanes) return MATRIX_REJECT("alignment");
+  if (lanes & (lanes - 1)) return MATRIX_REJECT("alignment");
+  // Wider EVU beats keep each CUTE row separate; unused upper lanes are masked.
+  const unsigned active = lanes < 8 ? lanes : 8;
+  if (col % active || active > MATRIX_DIM - col) return MATRIX_REJECT("alignment");
   const unsigned start = row * MATRIX_DIM + col;
-  if (mask != (UINT64_C(1) << lanes) - 1) return MATRIX_REJECT("mask");
+  if (mask != (UINT64_C(1) << active) - 1) return MATRIX_REJECT("mask");
   if (matrix.last) return MATRIX_REJECT("after-last");
   uint8_t expected_flags = 0;
-  for (unsigned lane = 0; lane < lanes; ++lane) {
+  for (unsigned lane = 0; lane < active; ++lane) {
     if (matrix.processed[start + lane]) return MATRIX_REJECT("duplicate");
     expected_flags |= matrix.flags[start + lane];
   }
-  const bool complete = matrix.processed_count + lanes == MATRIX_ELEMENTS;
-  if (memcmp(data, &matrix.output[start], bytes)) return MATRIX_REJECT("data");
+  const bool complete = matrix.processed_count + active == MATRIX_ELEMENTS;
+  if (memcmp(data, &matrix.output[start], active * sizeof(uint32_t))) return MATRIX_REJECT("data");
   if (flags != expected_flags) return MATRIX_REJECT("flags");
   if (last != complete) return MATRIX_REJECT("last");
 #undef MATRIX_REJECT
-  memset(&matrix.processed[start], 1, lanes);
-  matrix.processed_count += lanes;
+  memset(&matrix.processed[start], 1, active);
+  matrix.processed_count += active;
   matrix.sticky_flags |= expected_flags;
   matrix.last = last;
   return 0;

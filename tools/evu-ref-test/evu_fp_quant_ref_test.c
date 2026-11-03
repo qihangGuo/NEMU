@@ -81,7 +81,8 @@ int main(int argc, char **argv) {
   for (unsigned i = 0; i < 128; ++i) { input[i] = patterns[i % 16]; scale[i] = raw(i % 3 == 0 ? 0.5f : 1.0f); }
   load(3, 128, input, 0x80010000); load(4, 128, scale, 0x80010400);
   CHECK(get_reg(3, snapshot, 512) == 0);
-  const unsigned lengths[] = {0, 1, 7, 8, 9, 31, 32, 33, 63, 64};
+  const unsigned lengths[] = {0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64};
+  const unsigned lanes = CONFIG_CUSTOM_EVU_DLEN / 32;
   unsigned writes = 0;
   for (unsigned t = 0; t < sizeof(lengths) / sizeof(lengths[0]); ++t) {
     unsigned vl = lengths[t], row = t % 2 ? 127 : 8, reg = t % 4;
@@ -91,8 +92,8 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < vl; ++i) expected[i] = quantize(from_raw(input[i]), from_raw(scale[i]), &f);
     run(q, (row << 2) | reg, 0);
     if (vl) CHECK(complete(pc, q, f, false, 0, false) != 0); // missing writes
-    for (unsigned start = 0; start < vl; start += 8) {
-      uint8_t data[32] = {0}; unsigned n = vl - start < 8 ? vl - start : 8;
+    for (unsigned start = 0; start < vl; start += lanes) {
+      uint8_t data[32] = {0}; unsigned n = vl - start < lanes ? vl - start : lanes;
       unsigned offset = start % 32, bank = row % 8, entry = (row / 8) * 2 + start / 32;
       uint64_t mask = ((UINT64_C(1) << n) - 1) << offset;
       memcpy(data + offset, expected + start, n);

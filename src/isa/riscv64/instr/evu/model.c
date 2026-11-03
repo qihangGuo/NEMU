@@ -103,7 +103,8 @@ static uint64_t evu_csr_peek(uint32_t addr) {
   case 0xbc8: return cpu.evu.state;
   case 0xcd0: return EVU_VLEN_BYTES;
   case 0xcd1: return UINT64_C(1) | (UINT64_C(8) << 8) | (UINT64_C(7) << 16) | (UINT64_C(1) << 24) |
-    ((uint64_t)(CONFIG_CUSTOM_EVU_DLEN == 256) << 25) | (UINT64_C(1) << 26);
+    ((uint64_t)(CONFIG_CUSTOM_EVU_DLEN == 256 || CONFIG_CUSTOM_EVU_DLEN == 512) << 25) |
+    (UINT64_C(1) << 26);
   case 0xcd2: return cpu.evu.status;
   case 0xcd3: return cpu.evu.cause;
   case 0xcd4: return cpu.evu.epc;
@@ -461,7 +462,8 @@ void evu_execute(Decode *s, uint32_t instr, uint64_t base) {
   if (opcode == EVU_FP_QUANT_TO_CUTE && evu_lmul_regs(current.lmul) > 1)
     longjmp_exception(EX_II);
   if (opcode == EVU_FP_QUANT_TO_CUTE &&
-      (base >> 9 || evu_current_vl(2) > 64 || CONFIG_CUSTOM_EVU_DLEN != 256))
+      (base >> 9 || evu_current_vl(2) > 64 ||
+       (CONFIG_CUSTOM_EVU_DLEN != 256 && CONFIG_CUSTOM_EVU_DLEN != 512)))
     longjmp_exception(EX_II);
   reserve_job();
 
@@ -626,7 +628,7 @@ int difftest_evu_cute_write(uint32_t reg, uint32_t bank, uint32_t entry,
   if (job->opcode != EVU_FP_QUANT_TO_CUTE) return 1;
   const unsigned row = job->base >> 2;
   const unsigned offset = job->written % 32;
-  const unsigned lanes = 8;
+  const unsigned lanes = CONFIG_CUSTOM_EVU_DLEN / 32;
   const unsigned remaining = job->output_bytes - job->written;
   const unsigned n = remaining < lanes ? remaining : lanes;
   const uint64_t expected_mask = ((UINT64_C(1) << n) - 1) << offset;
