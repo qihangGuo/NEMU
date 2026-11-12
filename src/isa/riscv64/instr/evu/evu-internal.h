@@ -9,7 +9,6 @@
 #define EVU_DLEN_BYTES (CONFIG_CUSTOM_EVU_DLEN / 8)
 #define EVU_MAX_ELEMS EVU_VLEN_BYTES
 #define EVU_MAX_GROUP_BYTES (8 * EVU_VLEN_BYTES)
-#define EVU_DESCRIPTORS 8
 #define EVU_QUEUE 64
 
 enum {
@@ -28,8 +27,7 @@ enum {
   EVU_EXP2 = 0x0f,
   EVU_LOAD = 0x10,
   EVU_STORE = 0x11,
-  EVU_LAUNCH = 0x18,
-  EVU_WAIT = 0x19,
+  /* 0x18 (Launch), 0x50 and 0x5e (direct quantization) are retired. */
   EVU_FENCE = 0x1a,
   EVU_SLL = 0x20,
   EVU_SRL = 0x21,
@@ -62,7 +60,6 @@ enum {
   EVU_SETVL = 0x46,
   EVU_GATHER = 0x47,
   EVU_SCATTER = 0x48,
-  EVU_FP_QUANT_TO_CUTE = 0x50,
   EVU_GATHER_IMM = 0x51,
   EVU_LOAD_E0 = 0x52,
   EVU_STORE_E0 = 0x53,
@@ -76,20 +73,41 @@ enum {
   EVU_FSUB_SCALAR = 0x5b,
   EVU_FMUL_SCALAR = 0x5c,
   EVU_FMAX_SCALAR = 0x5d,
-  EVU_FP_QUANT_SCALAR = 0x5e,
+  EVU_FSQRT = 0x60,
+  EVU_FRSQRT7 = 0x61,
+  EVU_FSQRT_E0 = 0x62,
+  EVU_FRSQRT7_E0 = 0x63,
+  EVU_FREC7 = 0x64,
+  EVU_FREC7_E0 = 0x65,
+  EVU_FSGNJX = 0x66,
+  EVU_FWCVT_FF = 0x67,
+  EVU_FNCVT_FF = 0x68,
+  EVU_FCVT_XF = 0x69,
+  EVU_FCVT_FX = 0x6a,
+  EVU_NCLIP_IMM = 0x6b,
+  EVU_ZEXT2 = 0x6c,
+  EVU_SEXT2 = 0x6d,
+  EVU_NSRL_IMM = 0x6e,
+  EVU_CVT_I8_F32 = 0x70,
+  EVU_CVT_E4M3_F32 = 0x71,
+  EVU_CVT_E5M2_F32 = 0x72,
+  EVU_CVT_F32_E4M3 = 0x73,
+  EVU_CVT_MXFP8_F32 = 0x74,
+  EVU_CVT_MXFP4_F32 = 0x75,
   /* Retired SETMASK opcode 0x4d remains reserved. */
   /* Retired fixed-point QuantToCute (0x4c) and SETCFG (0x4e) are reserved. */
   /* Retired VRF quantization opcode 0x4f remains reserved. */
 };
 
 static inline bool evu_element_zero(uint32_t opcode) {
-  return opcode >= EVU_LOAD_E0 && opcode <= EVU_EXP2_E0;
+  return (opcode >= EVU_LOAD_E0 && opcode <= EVU_EXP2_E0) || opcode == EVU_FSQRT_E0 ||
+    opcode == EVU_FRSQRT7_E0 || opcode == EVU_FREC7_E0;
 }
 static inline bool evu_scalar_source(uint32_t opcode) {
   return opcode >= EVU_FADD_SCALAR && opcode <= EVU_FMAX_SCALAR;
 }
 static inline bool evu_scalar_form(uint32_t opcode) {
-  return evu_element_zero(opcode) || evu_scalar_source(opcode) || opcode == EVU_FP_QUANT_SCALAR;
+  return evu_element_zero(opcode) || evu_scalar_source(opcode);
 }
 static inline uint32_t evu_canonical_opcode(uint32_t opcode) {
   switch (opcode) {
@@ -101,10 +119,36 @@ static inline uint32_t evu_canonical_opcode(uint32_t opcode) {
   case EVU_FDIV_E0: return EVU_FDIV;
   case EVU_FMAX_E0: case EVU_FMAX_SCALAR: return EVU_FMAX;
   case EVU_EXP2_E0: return EVU_EXP2;
-  case EVU_FP_QUANT_SCALAR: return EVU_FP_QUANT_TO_CUTE;
+  case EVU_FSQRT_E0: return EVU_FSQRT;
+  case EVU_FRSQRT7_E0: return EVU_FRSQRT7;
+  case EVU_FREC7_E0: return EVU_FREC7;
   default: return opcode;
   }
 }
+
+static inline bool evu_low_precision(uint32_t opcode) {
+  return opcode >= EVU_CVT_I8_F32 && opcode <= EVU_CVT_MXFP4_F32;
+}
+static inline bool evu_lowp_scaled(uint32_t opcode) {
+  return opcode == EVU_CVT_MXFP8_F32 || opcode == EVU_CVT_MXFP4_F32;
+}
+
+static inline bool evu_rvv_math(uint32_t opcode) {
+  return opcode == EVU_FSQRT || opcode == EVU_FRSQRT7 || opcode == EVU_FREC7 ||
+    (opcode >= EVU_FSGNJX && opcode <= EVU_NSRL_IMM);
+}
+static inline bool evu_math_narrow(uint32_t opcode) {
+  return opcode == EVU_FNCVT_FF || opcode == EVU_NCLIP_IMM || opcode == EVU_NSRL_IMM;
+}
+static inline bool evu_math_extend(uint32_t opcode) {
+  return opcode == EVU_ZEXT2 || opcode == EVU_SEXT2;
+}
+static inline bool evu_math_unary(uint32_t opcode) {
+  return evu_rvv_math(opcode) && opcode != EVU_FSGNJX &&
+    opcode != EVU_NCLIP_IMM && opcode != EVU_NSRL_IMM;
+}
+
+uint64_t evu_fp_estimate7(uint64_t value, unsigned sew, bool reciprocal_sqrt);
 
 typedef struct {
   uint64_t pc;
@@ -122,7 +166,6 @@ typedef struct {
 
   bool writes_vrf;
   bool writes_memory;
-  bool writes_cute;
   bool writes_scalar;
   bool uses_fp;
   bool updates_vector_state;
@@ -152,7 +195,6 @@ typedef struct {
   bool vill;
 } EvuVType;
 
-void evu_compute_reset(void);
 void evu_compute_execute(Decode *s, EvuJob *job);
 void evu_read_register(uint32_t reg, void *data);
 void evu_publish_completion_flags(EvuJob *job);

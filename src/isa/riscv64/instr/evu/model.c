@@ -4,7 +4,6 @@
 #include "../../local-include/csr.h"
 #include "../../local-include/intr.h"
 #include "evu-internal.h"
-#include "matrix.h"
 #include <cpu/cpu.h>
 #include <cpu/difftest/evu.h>
 #include <memory/host.h>
@@ -42,7 +41,7 @@ static void reserve_job(void) {
 }
 
 static const uint16_t evu_csr_addresses[] = {
-  0x8c0, 0x8c1, 0x8c2, 0x8d0, 0x8d1, 0x8d2, 0x8d3, 0x8d4, 0x8d5, 0x8d6, 0x8d7,
+  0x8c0, 0x8c1, 0x8c2,
   0xbc8, 0xcd0, 0xcd1, 0xcd2, 0xcd3, 0xcd4, 0xcd5
 };
 
@@ -63,8 +62,9 @@ bool evu_permitted(void) {
     (cpu.mode == MODE_U && (cpu.evu.state & 4));
 }
 
-void evu_csr_check(uint32_t addr) {
+void evu_csr_check(uint32_t addr, bool is_write) {
   IFDEF(CONFIG_RVH, if (cpu.v) longjmp_exception(EX_II));
+  if (is_write && addr == 0x8c0 && cpu.mode != MODE_M) longjmp_exception(EX_II);
   if (addr == 0xbc8) {
     if (cpu.mode != MODE_M) longjmp_exception(EX_II);
   } else if (addr != 0xcd0 && addr != 0xcd1 && !evu_permitted()) {
@@ -83,10 +83,10 @@ void evu_context_dirty(void) {
   evu_summary();
 }
 
-static void configure(uint64_t avl, uint8_t type, bool enabled, bool force_vill) {
+static void configure(uint64_t avl, uint64_t type, bool enabled, bool force_vill) {
   const uint32_t sew = (type >> 3) & 7, lmul = type & 7;
   const uint32_t maximum = evu_vlmax(sew, lmul);
-  const bool illegal = force_vill || sew > 2 || lmul == 4 || maximum == 0;
+  const bool illegal = force_vill || (type >> 8) || sew > 2 || lmul == 4 || maximum == 0;
   cpu.evu.configured = enabled;
   cpu.evu.vtype = !enabled ? 0x10 : illegal ? UINT64_C(1) << 63 : type;
   cpu.evu.vl = !enabled ? EVU_VLEN_BITS / 32 : illegal ? 0 : avl < maximum ? avl : maximum;
@@ -102,23 +102,18 @@ static uint64_t evu_csr_peek(uint32_t addr) {
   case 0x8c2: return cpu.evu.vxsat;
   case 0xbc8: return cpu.evu.state;
   case 0xcd0: return EVU_VLEN_BYTES;
-  case 0xcd1: return UINT64_C(1) | (UINT64_C(8) << 8) | (UINT64_C(7) << 16) | (UINT64_C(1) << 24) |
-    ((uint64_t)(CONFIG_CUSTOM_EVU_DLEN == 256 || CONFIG_CUSTOM_EVU_DLEN == 512) << 25) |
-    (UINT64_C(1) << 26);
+  case 0xcd1: return UINT64_C(2) | (UINT64_C(7) << 16) | (UINT64_C(1) << 24) |
+    (UINT64_C(1) << 26) | (UINT64_C(1) << 27) | (UINT64_C(1) << 28) | (UINT64_C(1) << 29);
   case 0xcd2: return cpu.evu.status;
   case 0xcd3: return cpu.evu.cause;
   case 0xcd4: return cpu.evu.epc;
   case 0xcd5: return cpu.evu.tval;
-  default: return cpu.evu.descriptors[addr - 0x8d0];
+  default: panic("Unknown EVU CSR 0x%x", addr); return 0;
   }
 }
 
 static void evu_csr_drain(void) {
   Assert(count == 0, "EVU control access before older completion");
-  Assert(!evu_matrix_drain(), "EVU control access before matrix writes drained");
-  const uint8_t flags = evu_matrix_take_flags();
-  cpu.evu.fflags |= flags;
-  if (flags) evu_context_dirty();
 }
 
 uint64_t evu_csr_read(uint32_t addr) {
@@ -127,9 +122,10 @@ uint64_t evu_csr_read(uint32_t addr) {
 }
 
 void evu_csr_write(uint32_t addr, uint64_t value) {
+  if (addr == 0x8c0 && cpu.mode != MODE_M) longjmp_exception(EX_II);
   evu_csr_drain();
   switch (addr) {
-  case 0x8c0: configure((uint32_t)value, value >> 32, (value >> 40) & 1, value >> 63); break;
+  case 0x8c0: configure((uint32_t)value, (value >> 32) & 255, (value >> 40) & 1, value >> 63); break;
   case 0x8c1: cpu.evu.fflags = value & 31; evu_context_dirty(); break;
   case 0x8c2: cpu.evu.vxsat = value & 1; evu_context_dirty(); break;
   case 0xbc8:
@@ -137,11 +133,7 @@ void evu_csr_write(uint32_t addr, uint64_t value) {
     if (value & 256) cpu.evu.status = cpu.evu.cause = cpu.evu.epc = cpu.evu.tval = 0;
     evu_summary();
     break;
-  default:
-    if (addr >= 0x8d0 && addr <= 0x8d7) {
-      cpu.evu.descriptors[addr - 0x8d0] = ((value >> 48) & 3) <= 2 ? value & ((UINT64_C(1) << 51) - 1) : 0;
-      evu_context_dirty();
-    }
+  default: break;
   }
 }
 
@@ -164,7 +156,6 @@ void evu_csr_import(const uint64_t *values) {
   cpu.evu.cause = values[0xcd3] & 15;
   cpu.evu.epc = values[0xcd4];
   cpu.evu.tval = values[0xcd5];
-  for (unsigned i = 0; i < 8; ++i) cpu.evu.descriptors[i] = values[0x8d0 + i] & ((UINT64_C(1) << 51) - 1);
   evu_summary();
 }
 
@@ -176,8 +167,6 @@ static uint32_t write_group_mask(uint8_t regs) {
   return (UINT32_C(1) << regs) - 1;
 }
 
-void evu_compute_reset(void);
-
 void evu_reset(void) {
   head = count = 0;
   reserve_job();
@@ -188,8 +177,6 @@ void evu_reset(void) {
   cpu.evu.vlenb = EVU_VLEN_BYTES;
   cpu.evu.vl = EVU_VLEN_BITS / 32;
   cpu.evu.vtype = 2 << 3;
-  evu_compute_reset();
-  evu_matrix_reset();
 }
 
 static void overlay_job_register(const EvuJob *job, uint32_t reg, uint8_t *data) {
@@ -348,11 +335,12 @@ static void execute_memory(EvuJob *job) {
 }
 
 static bool is_control(uint32_t opcode) {
-  return opcode == EVU_LAUNCH || opcode == EVU_WAIT || opcode == EVU_FENCE || opcode == EVU_SETVLI ||
+  return opcode == EVU_FENCE || opcode == EVU_SETVLI ||
          opcode == EVU_SETVL;
 }
 
 static bool is_supported_opcode(uint32_t opcode) {
+  if (evu_rvv_math(opcode) || evu_low_precision(opcode)) return true;
   switch (opcode) {
   case EVU_ADD:
   case EVU_SUB:
@@ -398,9 +386,6 @@ static bool is_supported_opcode(uint32_t opcode) {
   case EVU_SETVL:
   case EVU_GATHER:
   case EVU_GATHER_IMM:
-  case EVU_FP_QUANT_TO_CUTE:
-  case EVU_LAUNCH:
-  case EVU_WAIT:
   case EVU_FENCE:
     return true;
   default:
@@ -413,7 +398,11 @@ static bool valid_width(uint32_t opcode, uint32_t sew) {
     return true;
   if (sew > 2)
     return false;
-  if (opcode == EVU_FP_QUANT_TO_CUTE) return sew == 2;
+  if (evu_low_precision(opcode)) return sew == 2;
+  if (opcode == EVU_FWCVT_FF || opcode == EVU_FNCVT_FF) return sew == 1;
+  if (opcode == EVU_FCVT_XF || opcode == EVU_FCVT_FX) return sew == 2;
+  if (opcode == EVU_NCLIP_IMM || opcode == EVU_NSRL_IMM) return sew <= 1;
+  if (evu_rvv_math(opcode)) return sew >= 1;
   if (opcode == EVU_WADD || opcode == EVU_WSUB || opcode == EVU_WMUL)
     return sew < 2;
   if (opcode == EVU_FADD || opcode == EVU_FSUB || opcode == EVU_FMUL || opcode == EVU_FMACC || opcode == EVU_FDIV ||
@@ -423,16 +412,15 @@ static bool valid_width(uint32_t opcode, uint32_t sew) {
   return true;
 }
 
-static uint8_t setv_config_aux(uint32_t instr) {
-  return (uint8_t)((((instr >> 15) & 0x7) << 5) | ((instr >> 7) & 0x1f));
-}
-
 static void execute_setv(Decode *s, EvuJob *job) {
-  const uint8_t aux = job->aux;
-  const uint32_t mag = aux & 3;
-  const uint32_t lmul = (aux & 4) ? (8 - mag) & 7 : mag;
-  const uint32_t sew = job->opcode == EVU_SETVLI ? (aux >> 3) & 7 : job->sew;
-  configure(job->base, (aux & 0xc0) | (sew << 3) | lmul, true, (aux & 4) && mag == 0);
+  // Capture both inputs before writing rd, including rd=rs1/rs2 aliases.
+  const uint64_t type = job->opcode == EVU_SETVLI ?
+    ((((job->instr >> 12) & 7) << 5) | ((job->instr >> 20) & 31)) : cpu.gpr[job->vs2]._64;
+  configure(job->base, type, true, false);
+  job->aux = (uint8_t)type;
+  // Scalar retirement observes VL immediately, even in asynchronous mode.
+  // Do not set writes_scalar: external completion must not rewrite rd later.
+  if (job->vd) cpu.gpr[job->vd]._64 = cpu.evu.vl;
   job->updates_vector_state = true;
   (void)s;
 }
@@ -444,26 +432,22 @@ void evu_execute(Decode *s, uint32_t instr, uint64_t base) {
   const uint32_t opcode = evu_canonical_opcode(raw_opcode);
   const uint32_t sew = (instr >> 12) & 0x7;
   if ((evu_scalar_form(raw_opcode) && sew != 2) || !is_supported_opcode(opcode) || !valid_width(opcode, sew) ||
-      (opcode == EVU_LAUNCH && (sew != 4 || !evu_matrix_physical_mode()))) {
+      (evu_math_unary(opcode) && ((instr >> 15) & 31) != 0) ||
+      (opcode == EVU_SETVL && sew != 7)) {
     longjmp_exception(EX_II);
   }
-#ifndef CONFIG_RV_AME
-  if (opcode == EVU_LAUNCH || opcode == EVU_FP_QUANT_TO_CUTE)
-    longjmp_exception(EX_II);
-#endif
 
   const EvuVType current = evu_current_vtype();
+  if (evu_low_precision(opcode)) {
+    const unsigned dest = (instr >> 7) & 31;
+    const unsigned source1 = (instr >> 15) & 31;
+    const unsigned source2 = (instr >> 20) & 31;
+    if (current.lmul != 0 || cpu.evu.vstart != 0 || dest == source2 ||
+        (evu_lowp_scaled(opcode) ? dest == source1 : source1 != 0)) longjmp_exception(EX_II);
+  }
   if (evu_scalar_form(raw_opcode) && (current.lmul != 0 || (cpu.evu.configured && current.sew != 2)))
     longjmp_exception(EX_II);
   if (!is_control(opcode) && current.vill)
-    longjmp_exception(EX_II);
-  // The current CUTE quantizer streams one physical VRF register. Larger
-  // groups would wrap its chunk counter and must fail before retirement.
-  if (opcode == EVU_FP_QUANT_TO_CUTE && evu_lmul_regs(current.lmul) > 1)
-    longjmp_exception(EX_II);
-  if (opcode == EVU_FP_QUANT_TO_CUTE &&
-      (base >> 9 || evu_current_vl(2) > 64 ||
-       (CONFIG_CUSTOM_EVU_DLEN != 256 && CONFIG_CUSTOM_EVU_DLEN != 512)))
     longjmp_exception(EX_II);
   reserve_job();
 
@@ -478,21 +462,14 @@ void evu_execute(Decode *s, uint32_t instr, uint64_t base) {
   job->vs1 = (instr >> 15) & 31;
   job->vs2 = (instr >> 20) & 31;
   job->aux = (evu_element_zero(raw_opcode) ? 0x40 : 0) |
-    (evu_scalar_source(raw_opcode) ? 0x20 : 0) | (raw_opcode == EVU_FP_QUANT_SCALAR ? 0x10 : 0);
+    (evu_scalar_source(raw_opcode) ? 0x20 : 0);
   job->vstart = 0;
   if (!is_control(opcode) && !valid_width(opcode, job->sew)) longjmp_exception(EX_II);
 
-  if (opcode == EVU_LAUNCH) {
-    uint32_t scale_a[EVU_VLEN_BITS / 32], scale_b[EVU_VLEN_BITS / 32];
-    evu_read_register(job->vs2, scale_a);
-    evu_read_register(job->vd, scale_b);
-    job->aux = (uint8_t)((((instr >> 15) & 0x7) << 5));
-    evu_matrix_launch(job->pc, job->base, scale_a, scale_b, asynchronous);
-  } else if (opcode == EVU_SETVLI || opcode == EVU_SETVL) {
-    job->aux = setv_config_aux(instr);
+  if (opcode == EVU_SETVLI || opcode == EVU_SETVL) {
     execute_setv(s, job);
     job->vl = (uint32_t)cpu.evu.vl;
-  } else if (opcode != EVU_WAIT && opcode != EVU_FENCE) {
+  } else if (opcode != EVU_FENCE) {
     job->vl = evu_current_vl(job->sew);
     if (evu_element_zero(raw_opcode))
       job->vl = job->vl != 0 && cpu.evu.vstart == 0 ? 1 : 0;
@@ -502,25 +479,15 @@ void evu_execute(Decode *s, uint32_t instr, uint64_t base) {
       evu_compute_execute(s, job);
   }
 
-  if (opcode != EVU_STORE && opcode != EVU_WAIT && opcode != EVU_FENCE)
+  if (opcode != EVU_STORE && opcode != EVU_FENCE)
     evu_context_dirty();
   if (asynchronous) {
     ++count;
   } else {
-    if (opcode == EVU_FENCE) {
-      job->flags = evu_matrix_take_flags();
-      Assert(!evu_matrix_drain(), "Incomplete synchronous EVU matrix stream");
-    }
     if (job->writes_memory && !job->cause) {
       const unsigned element_bytes = 1u << job->sew;
       for (uint32_t i = job->vstart; i < job->vl; ++i) {
         memcpy(guest_to_host(job->physical[i]), job->output + (size_t)i * element_bytes, element_bytes);
-      }
-    }
-    if (job->opcode == EVU_FP_QUANT_TO_CUTE && !job->cause) {
-      for (unsigned i = 0; i < job->output_bytes; ++i) {
-        const unsigned row = job->base >> 2;
-        evu_matrix_cute_byte(job->base & 3, row % 8, (row / 8) * 2 + i / 32, i % 32, job->output[i]);
       }
     }
     if ((job->writes_vrf || job->writes_scalar) && !job->cause) {
@@ -529,17 +496,17 @@ void evu_execute(Decode *s, uint32_t instr, uint64_t base) {
       if (job->writes_scalar && job->scalar_rd != 0)
         cpu.gpr[job->scalar_rd]._64 = job->scalar_value;
       cpu.evu.vstart = 0;
-      }
+    }
     evu_publish_completion_flags(job);
   }
 }
 
 void difftest_evu_set_async(bool enable) {
-  Assert(count == 0 && !evu_matrix_active(), "Cannot change EVU reference mode with pending work");
+  Assert(count == 0, "Cannot change EVU reference mode with pending work");
   asynchronous = enable;
 }
 
-int difftest_evu_pending(void) { return count + evu_matrix_active(); }
+int difftest_evu_pending(void) { return count; }
 
 uint32_t difftest_evu_reg_valid(void) { return defined_registers; }
 
@@ -553,9 +520,7 @@ int difftest_evu_get_reg(uint32_t reg, void *data, size_t bytes) {
 int difftest_evu_get_csr(void *data, size_t bytes) {
   const uint64_t values[] = {cpu.evu.vl, cpu.evu.vtype, 0, cpu.evu.vlenb, cpu.evu.configured,
     cpu.evu.fflags, cpu.evu.vxsat, cpu.evu.state, cpu.evu.status & ~UINT64_C(1),
-    cpu.evu.cause, cpu.evu.epc, cpu.evu.tval,
-    cpu.evu.descriptors[0], cpu.evu.descriptors[1], cpu.evu.descriptors[2], cpu.evu.descriptors[3],
-    cpu.evu.descriptors[4], cpu.evu.descriptors[5], cpu.evu.descriptors[6], cpu.evu.descriptors[7], evu_csr_peek(0x8c0)};
+    cpu.evu.cause, cpu.evu.epc, cpu.evu.tval, evu_csr_peek(0x8c0)};
   if (bytes != sizeof(values))
     return 1;
   memcpy(data, values, bytes);
@@ -563,8 +528,6 @@ int difftest_evu_get_csr(void *data, size_t bytes) {
 }
 
 int difftest_evu_store(uint64_t addr, const void *data, uint64_t mask) {
-  if (evu_matrix_owns(addr))
-    return evu_matrix_store(addr, data, mask);
   if (!mask || (addr & 63) || !in_pmem(addr) || !in_pmem(addr + 63)) {
     fprintf(stderr, "EVU store order/address/mask mismatch at 0x%lx mask=0x%lx\n", addr, mask);
     return 1;
@@ -614,55 +577,17 @@ int difftest_evu_store(uint64_t addr, const void *data, uint64_t mask) {
   return 0;
 }
 
-int difftest_evu_cute_write(uint32_t reg, uint32_t bank, uint32_t entry,
-                             const void *data, size_t bytes, uint64_t mask) {
-  EvuJob *job = NULL;
-  for (unsigned i = 0; i < count; ++i) {
-    EvuJob *candidate = &jobs[(head + i) % capacity];
-    if (candidate->writes_cute && candidate->written < candidate->output_bytes) {
-      job = candidate;
-      break;
-    }
-  }
-  if (!job || !data || bytes != 32) return 1;
-  if (job->opcode != EVU_FP_QUANT_TO_CUTE) return 1;
-  const unsigned row = job->base >> 2;
-  const unsigned offset = job->written % 32;
-  const unsigned lanes = CONFIG_CUSTOM_EVU_DLEN / 32;
-  const unsigned remaining = job->output_bytes - job->written;
-  const unsigned n = remaining < lanes ? remaining : lanes;
-  const uint64_t expected_mask = ((UINT64_C(1) << n) - 1) << offset;
-  if (reg != (job->base & 3) || bank != row % 8 ||
-      entry != (row / 8) * 2 + job->written / 32 ||
-      mask != expected_mask) return 1;
-  const uint8_t *actual = data;
-  for (unsigned i = 0; i < n; ++i)
-    if (actual[offset + i] != job->output[job->written + i]) return 1;
-  // Check the complete event before changing reference state.
-  for (unsigned i = 0; i < n; ++i)
-    evu_matrix_cute_byte(reg, bank, entry, offset + i, job->output[job->written + i]);
-  job->written += n;
-  return 0;
-}
-
 int difftest_evu_complete(uint64_t pc, uint32_t instr, uint8_t flags, bool exception, uint8_t cause) {
   if (!count)
     return 1;
   EvuJob *job = &jobs[head];
-  if (job->opcode == EVU_FENCE)
-    job->flags = evu_matrix_flags();
   const uint32_t expected_store_bytes = job->writes_memory ? (job->vl - job->vstart) * (1u << job->sew) : 0;
   const bool missing_stores = job->writes_memory && !job->cause && job->written != expected_store_bytes;
   if (job->pc != pc || job->instr != instr || job->flags != flags || (job->cause != 0) != exception ||
-      job->cause != cause || missing_stores ||
-      (job->opcode == EVU_FP_QUANT_TO_CUTE && job->written != job->output_bytes)) {
+      job->cause != cause || missing_stores) {
     fprintf(stderr, "EVU completion mismatch pc=0x%lx/0x%lx instr=0x%x/0x%x flags=0x%x/0x%x stores=%u/%u\n", pc,
             job->pc, instr, job->instr, flags, job->flags, job->written, expected_store_bytes);
     return 1;
-  }
-  if (job->opcode == EVU_FENCE) {
-    if (evu_matrix_drain()) return 1;
-    evu_matrix_take_flags();
   }
   if (!job->cause) {
     if (job->writes_vrf)
@@ -685,11 +610,10 @@ int difftest_evu_complete_v2(uint64_t pc, uint32_t instr, uint8_t flags, bool ex
 }
 
 int difftest_evu_drain(uint8_t flags, bool exception, uint8_t cause, uint64_t pc, uint64_t tval, bool valid) {
-  (void)pc; (void)tval; (void)cause;
   // A physical bus failure must also be injected into the reference memory model.
   // Never silently accept an unexplained DUT failure or its numeric result.
-  if (count || exception || valid || flags != evu_matrix_flags()) return 1;
-  if (evu_matrix_drain()) return 1;
+  // Ordinary flags and faults have already been checked at ordered completion.
+  if (count || exception || valid || flags || cause || pc || tval) return 1;
   evu_csr_drain();
   return 0;
 }

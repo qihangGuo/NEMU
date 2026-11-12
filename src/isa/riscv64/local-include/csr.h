@@ -124,8 +124,6 @@
 #ifdef CONFIG_CUSTOM_EVU
 #define CSRS_UNPRIV_EVU(f) \
   f(evcfg, 0x8c0) f(efflags, 0x8c1) f(evxsat, 0x8c2) \
-  f(eqdesc0, 0x8d0) f(eqdesc1, 0x8d1) f(eqdesc2, 0x8d2) f(eqdesc3, 0x8d3) \
-  f(eqdesc4, 0x8d4) f(eqdesc5, 0x8d5) f(eqdesc6, 0x8d6) f(eqdesc7, 0x8d7) \
   f(mevstate, 0xbc8) f(evlenb, 0xcd0) f(evcap, 0xcd1) f(evstatus, 0xcd2) \
   f(evcause, 0xcd3) f(evepc, 0xcd4) f(evtval, 0xcd5)
 #else

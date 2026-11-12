@@ -7,7 +7,6 @@ typedef struct {
   /* EVU-local vector control state exported through dedicated Difftest APIs. */
   uint64_t vl, vtype, vstart, vlenb, configured;
   uint64_t fflags, vxsat, state, status, cause, epc, tval;
-  uint64_t descriptors[8];
 } riscv64_EvuState;
 
 #endif

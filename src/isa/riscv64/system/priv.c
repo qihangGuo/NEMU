@@ -3475,7 +3475,7 @@ static inline bool csrind_permit_check(const uint32_t addr) {
 
 static inline void csr_permit_check(uint32_t addr, bool is_write) {
 #ifdef CONFIG_CUSTOM_EVU
-  if (evu_csr_address(addr)) evu_csr_check(addr);
+  if (evu_csr_address(addr)) evu_csr_check(addr, is_write);
 #endif
   bool has_vi = false; // virtual instruction
   word_t *dest_access = csr_decode(addr);

@@ -71,6 +71,17 @@ static inline float64_t rtlToF64(rtlreg_t r) {
   return f;
 }
 
+#if defined(CONFIG_CUSTOM_EVU) && defined(CONFIG_FPU_SOFT)
+uint64_t evu_fp_estimate7(uint64_t value, unsigned sew, bool reciprocal_sqrt) {
+  if (sew == 1) {
+    const float16_t input = { .v = (uint16_t)value };
+    return reciprocal_sqrt ? f16_rsqrte7(input).v : f16_recip7(input).v;
+  }
+  const float32_t input = { .v = (uint32_t)value };
+  return reciprocal_sqrt ? f32_rsqrte7(input).v : f32_recip7(input).v;
+}
+#endif
+
 uint32_t isa_fp_get_rm(Decode *s);
 void isa_fp_set_ex(uint32_t ex);
 void isa_fp_csr_check();

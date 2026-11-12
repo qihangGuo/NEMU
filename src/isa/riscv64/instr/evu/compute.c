@@ -4,6 +4,7 @@
 #include "../../local-include/intr.h"
 #include "../rvv/vfexp2.h"
 #include "evu-internal.h"
+#include "lowp.h"
 #include <cpu/cpu.h>
 #include <rtl/fp.h>
 #include <rtl/rtl.h>
@@ -398,7 +399,7 @@ static void execute_fp_reduce(Decode *s, EvuJob *job, const uint8_t *vs2, const 
 
 static void execute_permute(EvuJob *job, const uint8_t *vs2, const uint8_t *vs1, uint8_t *output, uint32_t vl,
                             uint32_t vlmax) {
-  const uint64_t offset = job->opcode == EVU_GATHER_IMM ? job->vs1 : get_element(vs1, 0, job->sew);
+  const uint64_t offset = job->opcode == EVU_GATHER_IMM ? job->vs1 : job->base;
   for (uint32_t idx = job->vstart; idx < vl; ++idx) {
     uint64_t result = 0;
     if (job->opcode == EVU_GATHER || job->opcode == EVU_GATHER_IMM) {
@@ -408,7 +409,7 @@ static void execute_permute(EvuJob *job, const uint8_t *vs2, const uint8_t *vs1,
     } else if (job->opcode == EVU_SLIDE_UP) {
       result = idx >= offset ? get_element(vs2, idx - offset, job->sew) : get_element(output, idx, job->sew);
     } else if (job->opcode == EVU_SLIDE_DOWN) {
-      result = (uint64_t)idx + offset < vlmax ? get_element(vs2, idx + offset, job->sew) : 0;
+      result = offset < vlmax && idx < vlmax - offset ? get_element(vs2, idx + offset, job->sew) : 0;
     } else {
       Assert(0, "unexpected EVU permute operation 0x%x", job->opcode);
     }
@@ -427,40 +428,73 @@ static void execute_exp2(Decode *s, EvuJob *job, const uint8_t *vs2, uint8_t *ou
   fill_tail(output, vl, vlmax, job->sew, evu_current_vtype().vta);
 }
 
-/* FP probability quantization deliberately rounds multiplication before the
- * add, matching RVV's separate vfmul/vfadd, then minNum/clamp and RTZ. */
-static void execute_fp_quant_to_cute(EvuJob *job, const uint8_t *input, const uint8_t *scale, uint32_t vl) {
-  const uint_fast8_t saved_flags = softfloat_exceptionFlags;
-  const uint_fast8_t saved_rounding = softfloat_roundingMode;
-  const uint_fast8_t saved_tininess = softfloat_detectTininess;
-  softfloat_exceptionFlags = 0;
-  softfloat_roundingMode = softfloat_round_near_even;
-  softfloat_detectTininess = softfloat_tininess_afterRounding;
-  const float32_t zero = { .v = 0 }, half = { .v = 0x3f000000 }, limit = { .v = 0x42fe0000 };
-  for (unsigned i = 0; i < vl; ++i) {
-    const float32_t a = { .v = (uint32_t)get_element(input, i, 2) };
-    const float32_t b = { .v = (uint32_t)get_element(scale, (job->aux & 0x10) ? 0 : i, 2) };
-    float32_t value = f32_add(f32_mul(a, b), half);
-    // lt_quiet agrees with HardFloat signaling=false (sNaN alone sets NV).
-    if (!(f32_lt_quiet(value, limit) || f32_eq(value, limit))) value = limit;
-    if (f32_lt_quiet(value, zero)) value = zero;
-    job->output[i] = (uint8_t)f32_to_ui32(value, softfloat_round_minMag, true);
+static void execute_rvv_math(EvuJob *job, const uint8_t *source, const uint8_t *source1, uint32_t vl) {
+  const unsigned opcode = job->opcode;
+  const unsigned input_sew = job->sew + evu_math_narrow(opcode) - evu_math_extend(opcode);
+  const unsigned output_sew = job->sew + (opcode == EVU_FWCVT_FF);
+  const unsigned input_bits = 8u << input_sew;
+  job->uses_fp = opcode != EVU_NCLIP_IMM && opcode != EVU_NSRL_IMM && !evu_math_extend(opcode);
+  for (uint32_t index = job->vstart; index < vl; ++index) {
+    const uint64_t value = get_element(source, index, input_sew);
+    uint64_t result = 0;
+    switch (opcode) {
+    case EVU_FSQRT:
+      result = job->sew == 1 ? f16_sqrt((float16_t){ .v = value }).v :
+        f32_sqrt((float32_t){ .v = value }).v;
+      break;
+    case EVU_FRSQRT7:
+    case EVU_FREC7:
+      result = evu_fp_estimate7(value, job->sew, opcode == EVU_FRSQRT7);
+      break;
+    case EVU_FSGNJX: {
+      const uint64_t sign = UINT64_C(1) << (input_bits - 1);
+      result = value ^ (get_element(source1, index, input_sew) & sign);
+      break;
+    }
+    case EVU_FWCVT_FF: result = f16_to_f32((float16_t){ .v = value }).v; break;
+    case EVU_FNCVT_FF: result = f32_to_f16((float32_t){ .v = value }).v; break;
+    case EVU_FCVT_XF:
+      result = (uint32_t)f32_to_i32((float32_t){ .v = value }, softfloat_round_near_even, true);
+      break;
+    case EVU_FCVT_FX: result = i32_to_f32((int32_t)value).v; break;
+    case EVU_ZEXT2: result = value; break;
+    case EVU_SEXT2: result = sign_extend(value, input_bits); break;
+    case EVU_NSRL_IMM: result = value >> (job->vs1 & (input_bits - 1)); break;
+    case EVU_NCLIP_IMM: {
+      const unsigned shift = job->vs1 & (input_bits - 1);
+      int64_t rounded = sign_extend(value, input_bits) >> shift;
+      if (shift) rounded += (value >> (shift - 1)) & 1;
+      job->vxsat |= sat_signed(rounded, 8u << output_sew, &result);
+      break;
+    }
+    default: Assert(0, "unsupported RVV math opcode 0x%x", opcode);
+    }
+    set_element(job->output, index, output_sew, result);
   }
-  job->output_bytes = vl;
-  job->flags = (uint8_t)softfloat_exceptionFlags;
-  job->uses_fp = true;
-  job->writes_cute = true;
-  softfloat_exceptionFlags = saved_flags;
-  softfloat_roundingMode = saved_rounding;
-  softfloat_detectTininess = saved_tininess;
 }
 
-/* Reserved descriptor context slots have no execution consumer. */
-void evu_compute_reset(void) { memset(cpu.evu.descriptors, 0, sizeof(cpu.evu.descriptors)); }
+static void math_register_groups(const EvuJob *job, uint32_t lmul, unsigned *source_count,
+                                 unsigned *dest_count) {
+  const unsigned ordinary = evu_lmul_regs(lmul);
+  const unsigned doubled = lmul > 3 ? 1 : ordinary * 2;
+  *source_count = evu_math_narrow(job->opcode) ? doubled : evu_math_extend(job->opcode) ?
+    (ordinary > 1 ? ordinary / 2 : 1) : ordinary;
+  *dest_count = job->opcode == EVU_FWCVT_FF ? doubled : ordinary;
+  if (*source_count > 8 || *dest_count > 8 || (evu_math_extend(job->opcode) && lmul == 5))
+    longjmp_exception(EX_II);
+  const bool overlap = job->vd < job->vs2 + *source_count && job->vs2 < job->vd + *dest_count;
+  if (!overlap) return;
+  if (evu_math_narrow(job->opcode) && job->vd != job->vs2) longjmp_exception(EX_II);
+  if (job->opcode == EVU_FWCVT_FF || evu_math_extend(job->opcode)) {
+    const bool source_whole = lmul <= 3 && (!evu_math_extend(job->opcode) || lmul != 0);
+    if (!source_whole || job->vs2 + *source_count != job->vd + *dest_count)
+      longjmp_exception(EX_II);
+  }
+}
 
 void evu_compute_execute(Decode *s, EvuJob *job) {
   const EvuVType vt = evu_current_vtype();
-  if (job->opcode == EVU_FENCE || job->opcode == EVU_WAIT || job->opcode == EVU_LAUNCH)
+  if (job->opcode == EVU_FENCE)
     return;
   const unsigned regs = source_regs(job);
   const uint32_t vlmax = evu_vlmax(job->sew, vt.lmul);
@@ -471,18 +505,17 @@ void evu_compute_execute(Decode *s, EvuJob *job) {
     job->opcode == EVU_FREDUCE_SUM || job->opcode == EVU_FREDUCE_MIN || job->opcode == EVU_FREDUCE_MAX;
   uint8_t vs2[EVU_MAX_GROUP_BYTES];
   uint8_t vs1[EVU_MAX_GROUP_BYTES];
-  read_group(vs2, job->vs2, regs);
-  if (job->opcode != EVU_EXP2 && job->opcode != EVU_GATHER_IMM)
+  unsigned input_regs = regs;
+  unsigned dest_regs = regs;
+  const bool slide = job->opcode == EVU_SLIDE_UP || job->opcode == EVU_SLIDE_DOWN;
+  if (job->opcode == EVU_SLIDE_UP && job->vd < job->vs2 + regs && job->vs2 < job->vd + regs)
+    longjmp_exception(EX_II);
+  if (evu_rvv_math(job->opcode)) math_register_groups(job, vt.lmul, &input_regs, &dest_regs);
+  read_group(vs2, job->vs2, input_regs);
+  if (job->opcode != EVU_EXP2 && job->opcode != EVU_GATHER_IMM && !slide &&
+      (!evu_rvv_math(job->opcode) || job->opcode == EVU_FSGNJX))
     read_group(vs1, job->vs1, reduction ? 1 : regs);
 
-  if (job->opcode == EVU_FP_QUANT_TO_CUTE) {
-    uint8_t inverse_scale[EVU_MAX_GROUP_BYTES];
-    read_group(inverse_scale, job->vd, 1);
-    if (vl != 0) execute_fp_quant_to_cute(job, vs2, inverse_scale, vl);
-    return;
-  }
-
-  unsigned dest_regs = regs;
   if (job->opcode == EVU_WADD || job->opcode == EVU_WSUB || job->opcode == EVU_WMUL)
     dest_regs = widening_dest_regs(vt.lmul);
   if (dest_regs > 8) longjmp_exception(EX_II);
@@ -497,7 +530,21 @@ void evu_compute_execute(Decode *s, EvuJob *job) {
   softfloat_roundingMode = softfloat_round_near_even;
   softfloat_detectTininess = softfloat_tininess_afterRounding;
 
-  switch (job->opcode) {
+  if (evu_low_precision(job->opcode)) {
+    job->uses_fp = true;
+    for (unsigned element = 0; element < vl; ++element) {
+      const bool decode = job->opcode == EVU_CVT_F32_E4M3;
+      const EvuLowpResult converted = evu_lowp_convert(get_element(vs2, element, decode ? 0 : 2),
+        job->opcode, evu_lowp_scaled(job->opcode) ? vs1[0] : 127);
+      job->flags |= converted.flags;
+      if (job->opcode == EVU_CVT_MXFP4_F32) {
+        if (!(element & 1)) job->output[element / 2] = converted.bits & 15;
+        else job->output[element / 2] |= (converted.bits & 15) << 4;
+      } else set_element(job->output, element, decode ? 2 : 0, converted.bits);
+    }
+  } else if (evu_rvv_math(job->opcode)) {
+    execute_rvv_math(job, vs2, vs1, vl);
+  } else switch (job->opcode) {
   case EVU_ADD:
   case EVU_SUB:
   case EVU_AND:

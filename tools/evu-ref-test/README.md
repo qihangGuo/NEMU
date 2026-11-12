@@ -3,10 +3,48 @@
 This host test loads `build/riscv64-nemu-interpreter-so` and exercises the EVU
 reference decoder without an emulator or RTL simulation. It covers SEW 8/16/32
 integer and floating-point element-wise operations, reductions, Exp2,
-generic vector LOAD/STORE and VL/tail state. The original computation test does not observe CUTE A/B writes; the separate
-FP quantization test described below checks accepted writes and downstream PV.
-It also checks LOAD into v0 and rejection of the retired opcodes
-`0x09/0x0b/0x38/0x4c/0x4d/0x4e/0x4f` without modifying v0. These encodings remain illegal.
+generic vector LOAD/STORE and VL/tail state. It also checks LOAD into v0 and
+rejection of the retired opcodes
+`0x09/0x0b/0x18/0x19/0x38/0x4c/0x4d/0x4e/0x4f/0x50/0x5e` without modifying v0.
+These encodings remain illegal; the dedicated quantization test is retired.
+
+## Scalar-offset slides
+
+On the server, `evu_compute_ref_test <reference.so> --slide` runs 216
+directed cases for both slide operations, SEW=8/16/32, m1/m2/mf2, zero/full
+VL and tails, data-path/register boundaries, large 64-bit offsets, x0,
+an odd-numbered scalar GPR under m2, and in-place slidedown. Expected bytes
+are computed independently of the EVU reference implementation. Additional
+negative cases reject slideup overlap, bad widths/groups and retired WAIT
+at both zero and nonzero VL. The default regression also runs these cases.
+Offsets now come from the CPU GPR operand, not an EVU register element.
+
+## RVV math extension
+
+Funct7 0x60..0x6e adds sqrt/rsqrt7/rec7 (including FP32 E0), sign XOR,
+FP16/FP32 conversion, FP32/INT32 conversion, signed immediate narrowing,
+zero/sign extension and immediate logical narrowing. EVCAP bit 28 advertises
+the complete set. FP arithmetic/conversion is RNE; integer clipping uses
+fixed RNU and reports EVXSAT. The estimate helpers reuse NEMU's standard RVV
+reference implementation without touching scalar FCSR.
+
+On the build server, after rebuilding the matching reference:
+
+```sh
+make -C tools/evu-ref-test NEMU_HOME="$PWD"
+./tools/evu-ref-test/evu_compute_ref_test \
+  ./build/riscv64-nemu-interpreter-so --rvv-math /tmp/evu-rvv-math.trace
+```
+
+The focused run checks 73 positive cases and illegal width/register-group
+cases before writing a trace for XSAI's `EvuRvvMathDifftestSpec`. Trace lines
+contain the custom instruction, VTYPE, VL, expected flags/saturation, four
+source registers, two sign-source registers and four expected destination
+registers, as little-endian byte tokens. The ordinary full reference suite
+also runs these cases. No generated trace or binary is checked in.
+
+The first 54-case version passed locally before the user requested server-only
+binary validation. The expanded cases require execution on the server.
 
 Build NEMU with `configs/riscv64-xs-evu-ref_defconfig` first, then run:
 
@@ -91,28 +129,10 @@ accelerator arithmetic and reference ABI; scalar core retirement and HBL2
 require full EMU validation.
 
 
-## Packed FP32 probability quantization and CUTE writes
+## Retired Matrix Coupling
 
-`evu_fp_quant_ref_test` covers the new custom0 funct7=0x50 command, separately
-rounded FP32 multiply/add, clamp to [0,127] and RTZ conversion. It packs one
-output byte per input lane and selects
-CUTE AB register and row via scalar rs1. Run against the rebuilt reference:
-
-```sh
-./tools/evu-ref-test/evu_fp_quant_ref_test \
-  ./build/riscv64-nemu-interpreter-so
-```
-
-The test checks 34 FP direct-write events across VL 0/1/7/8/9/31/32/33/63/64,
-IEEE special values and active-lane flags, wrong register/bank/entry/mask/data,
-missing and duplicate events, completion flags/saturation, and preserved VRF.
-It then produces an entire P tile before matrix launch and independently checks
-PV, verifying that reference AB state persists across launch. Negative cases
-intentionally print mismatch diagnostics; require the final success line and
-zero exit status.
-
-`difftest_evu_cute_write` compares RTL data to independently calculated bytes,
-then applies those reference bytes to the matrix oracle. New FP completion
-requires all writes. The whole-Attention native test and server instructions
-are in `XSAI_external_vector/software/evu/docs/FLASH_ATTENTION.md`. Neither
-native test runs RTL or measures EVU performance.
+Launch (0x18) and direct quantization (0x50/0x5e) are illegal instructions.
+The compute reference regression checks all three with VL=0 and nonzero VL,
+all encoded element widths, no queued completion and unchanged VRF contents.
+Ordinary AME matrix instructions no longer feed a separate EVU matrix oracle.
+CSR ABI 2 and the 13-word snapshot remain unchanged; EVCAP bit 25 is clear.
