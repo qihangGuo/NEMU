@@ -103,7 +103,8 @@ static uint64_t evu_csr_peek(uint32_t addr) {
   case 0xbc8: return cpu.evu.state;
   case 0xcd0: return EVU_VLEN_BYTES;
   case 0xcd1: return UINT64_C(2) | (UINT64_C(7) << 16) | (UINT64_C(1) << 24) |
-    (UINT64_C(1) << 26) | (UINT64_C(1) << 27) | (UINT64_C(1) << 28) | (UINT64_C(1) << 29);
+    (UINT64_C(1) << 26) | (UINT64_C(1) << 27) | (UINT64_C(1) << 28) | (UINT64_C(1) << 29) |
+    (UINT64_C(1) << 30);
   case 0xcd2: return cpu.evu.status;
   case 0xcd3: return cpu.evu.cause;
   case 0xcd4: return cpu.evu.epc;
@@ -343,6 +344,8 @@ static bool is_supported_opcode(uint32_t opcode) {
   if (evu_rvv_math(opcode) || evu_low_precision(opcode)) return true;
   switch (opcode) {
   case EVU_ADD:
+  case EVU_BLOCK_AMAX:
+  case EVU_BLOCK_PACK:
   case EVU_SUB:
   case EVU_AND:
   case EVU_OR:
@@ -399,6 +402,7 @@ static bool valid_width(uint32_t opcode, uint32_t sew) {
   if (sew > 2)
     return false;
   if (evu_low_precision(opcode)) return sew == 2;
+  if (opcode == EVU_BLOCK_AMAX || opcode == EVU_BLOCK_PACK) return sew == 2;
   if (opcode == EVU_FWCVT_FF || opcode == EVU_FNCVT_FF) return sew == 1;
   if (opcode == EVU_FCVT_XF || opcode == EVU_FCVT_FX) return sew == 2;
   if (opcode == EVU_NCLIP_IMM || opcode == EVU_NSRL_IMM) return sew <= 1;
@@ -438,6 +442,13 @@ void evu_execute(Decode *s, uint32_t instr, uint64_t base) {
   }
 
   const EvuVType current = evu_current_vtype();
+  if (opcode == EVU_BLOCK_AMAX || opcode == EVU_BLOCK_PACK) {
+    const bool amax = opcode == EVU_BLOCK_AMAX;
+    if (current.lmul != 0 || current.sew != 2 || cpu.evu.vstart != 0 ||
+        evu_current_vl(2) != (amax ? 64 : 16) ||
+        (amax ? (((instr >> 15) & 31) >= 4 || ((instr >> 7) & 31) == ((instr >> 20) & 31))
+              : (base >> 14) != 0)) longjmp_exception(EX_II);
+  }
   if (evu_low_precision(opcode)) {
     const unsigned dest = (instr >> 7) & 31;
     const unsigned source1 = (instr >> 15) & 31;

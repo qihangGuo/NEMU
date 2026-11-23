@@ -512,7 +512,9 @@ void evu_compute_execute(Decode *s, EvuJob *job) {
     longjmp_exception(EX_II);
   if (evu_rvv_math(job->opcode)) math_register_groups(job, vt.lmul, &input_regs, &dest_regs);
   read_group(vs2, job->vs2, input_regs);
-  if (job->opcode != EVU_EXP2 && job->opcode != EVU_GATHER_IMM && !slide &&
+  if (job->opcode == EVU_BLOCK_PACK)
+    read_group(vs1, job->base & 31, 1);
+  else if (job->opcode != EVU_BLOCK_AMAX && job->opcode != EVU_EXP2 && job->opcode != EVU_GATHER_IMM && !slide &&
       (!evu_rvv_math(job->opcode) || job->opcode == EVU_FSGNJX))
     read_group(vs1, job->vs1, reduction ? 1 : regs);
 
@@ -530,7 +532,29 @@ void evu_compute_execute(Decode *s, EvuJob *job) {
   softfloat_roundingMode = softfloat_round_near_even;
   softfloat_detectTininess = softfloat_tininess_afterRounding;
 
-  if (evu_low_precision(job->opcode)) {
+  if (job->opcode == EVU_BLOCK_AMAX) {
+    job->uses_fp = true;
+    for (unsigned group = 0; group < 4; ++group) {
+      rtlreg_t maximum = 0;
+      for (unsigned lane = 0; lane < 16; ++lane)
+        maximum = fp_binary(s, FPCALL_MAX, FPCALL_W32, maximum,
+          get_element(vs2, group * 16 + lane, 2) & UINT32_C(0x7fffffff));
+      set_element(job->output, job->vs1 * 4 + group, 2, maximum);
+    }
+  } else if (job->opcode == EVU_BLOCK_PACK) {
+    job->uses_fp = true;
+    const uint32_t descriptor = get_element(vs1, (job->base >> 7) & 15, 2);
+    const unsigned begin = ((job->base >> 5) & 3) * 16;
+    uint8_t *out = job->output + ((job->base >> 11) & 7) * 8;
+    for (unsigned lane = 0; lane < 16; ++lane) {
+      const uint32_t product = fp_binary(s, FPCALL_MUL, FPCALL_W32, get_element(vs2, begin + lane, 2),
+                                         descriptor & UINT32_C(0x7fffffff));
+      const EvuLowpResult code = evu_lowp_convert((descriptor >> 31) ? product : 0, EVU_CVT_MXFP4_F32, 127);
+      job->flags |= code.flags;
+      if (!(lane & 1)) out[lane / 2] = code.bits & 15;
+      else out[lane / 2] |= (code.bits & 15) << 4;
+    }
+  } else if (evu_low_precision(job->opcode)) {
     job->uses_fp = true;
     for (unsigned element = 0; element < vl; ++element) {
       const bool decode = job->opcode == EVU_CVT_F32_E4M3;

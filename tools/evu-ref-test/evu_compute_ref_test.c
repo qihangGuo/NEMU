@@ -338,6 +338,60 @@ static void check_rvv_math(const char *trace_path) {
   printf("EVU RVV math: %u cases, 15 encodings, m1/m2/mf2, E0, tails, flags, saturation and illegal groups passed\n", cases);
 }
 
+static void check_blocks(const char *path) {
+  FILE *trace = fopen(path, "w");
+  CHECK(trace);
+  uint32_t source[4 * VLEN_BYTES / 4] = {0}, other[2 * VLEN_BYTES / 4] = {0};
+  uint8_t expected[4 * VLEN_BYTES], actual[VLEN_BYTES];
+  const uint32_t values[] = {0xbf800000, 0xc0000000, 0xc0800000, 0x80000000};
+  for (unsigned n = 0; n < 12; ++n) {
+    const unsigned group = n % 4, slot = n % 8, index = 15 - n, vl = n < 4 ? 64 : 16;
+    for (unsigned i = 0; i < 64; ++i) source[i] = values[i / 16];
+    source[63] = 0x7f800001; /* Raises NV even when the product is subsequently cleared. */
+    other[index] = 0x3f800000 | ((uint32_t)(n != 7) << 31);
+    memset(expected, 0xa5, sizeof(expected));
+    unsigned flags = 0;
+    const unsigned control = 12 | (group << 5) | (index << 7) | (slot << 11);
+    uint32_t inst;
+    if (n < 4) {
+      inst = insn(0x76, 2, 8, group, 4);
+      flags = 16;
+      for (unsigned i = 0; i < 4; ++i) {
+        const uint32_t value = values[i] & 0x7fffffff;
+        memcpy(expected + 16 * group + 4 * i, &value, 4);
+      }
+    } else {
+      inst = insn(0x77, 2, 8, 10, 4);
+      for (unsigned i = 0; i < 16; ++i) {
+        uint32_t value = source[16 * group + i];
+        if (value == 0x7f800001) { value = 0x7fc00000; flags |= 16; }
+        EvuLowpResult v = evu_lowp_convert(n == 7 ? 0 : value, 0x75, 127);
+        uint8_t *byte = &expected[8 * slot + i / 2];
+        if (i & 1) *byte |= v.bits << 4; else *byte = v.bits;
+        flags |= v.flags;
+      }
+    }
+    write_evu_csr(0x8c0, (UINT64_C(1) << 40) | VLEN_BYTES);
+    memset(actual, 0xa5, sizeof(actual));
+    copy_mem(0x80074000, source, VLEN_BYTES, true);
+    copy_mem(0x80074800, other, VLEN_BYTES, true);
+    copy_mem(0x80074c00, actual, VLEN_BYTES, true);
+    load_reg(4, 0x80074000, 0); load_reg(12, 0x80074800, 0); load_reg(8, 0x80074c00, 0);
+    write_evu_csr(0x8c1, 0);
+    write_evu_csr(0x8c0, (UINT64_C(1) << 40) | (UINT64_C(16) << 32) | vl);
+    evu(inst, control, flags);
+    read_reg(8, actual);
+    CHECK(!memcmp(actual, expected, VLEN_BYTES));
+    fprintf(trace, "%08x 16 %u %u 0 base=%x", inst, vl, flags, control);
+    const void *buffers[] = {source, other, expected};
+    const unsigned sizes[] = {sizeof(source), sizeof(other), sizeof(expected)};
+    for (unsigned b = 0; b < 3; ++b)
+      for (unsigned i = 0; i < sizes[b]; ++i) fprintf(trace, " %02x", ((const uint8_t *)buffers[b])[i]);
+    fputc('\n', trace);
+  }
+  CHECK(fclose(trace) == 0);
+}
+
 static void check_low_precision(const char *trace_path) {
   FILE *trace = trace_path ? fopen(trace_path, "w") : NULL;
   CHECK(!trace_path || trace);
@@ -1315,7 +1369,7 @@ static void check_csr_isolation(void) {
 
 int main(int argc, char **argv) {
   CHECK(argc == 2 || argc == 3 || (argc == 4 &&
-    (strcmp(argv[2], "--replay") == 0 || strcmp(argv[2], "--rvv-math") == 0 || strcmp(argv[2], "--lowp") == 0)));
+    (strcmp(argv[2], "--replay") == 0 || strcmp(argv[2], "--rvv-math") == 0 || strcmp(argv[2], "--lowp") == 0 || strcmp(argv[2], "--blocks") == 0)));
   void *library = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
   if (!library) {
     fprintf(stderr, "%s\n", dlerror());
@@ -1369,6 +1423,11 @@ int main(int argc, char **argv) {
   csrs[0xbc8] = 1;
   copy_csrs(csrs, true);
   set_async(true);
+  if (argc == 4 && strcmp(argv[2], "--blocks") == 0) {
+    check_blocks(argv[3]);
+    dlclose(library);
+    return 0;
+  }
   if (argc == 3 && strcmp(argv[2], "--slide") == 0) {
     check_slides();
     dlclose(library);

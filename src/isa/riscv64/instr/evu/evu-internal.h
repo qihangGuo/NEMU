@@ -94,6 +94,8 @@ enum {
   EVU_CVT_F32_E4M3 = 0x73,
   EVU_CVT_MXFP8_F32 = 0x74,
   EVU_CVT_MXFP4_F32 = 0x75,
+  EVU_BLOCK_AMAX = 0x76,
+  EVU_BLOCK_PACK = 0x77,
   /* Retired SETMASK opcode 0x4d remains reserved. */
   /* Retired fixed-point QuantToCute (0x4c) and SETCFG (0x4e) are reserved. */
   /* Retired VRF quantization opcode 0x4f remains reserved. */
