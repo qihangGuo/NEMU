@@ -104,7 +104,7 @@ static uint64_t evu_csr_peek(uint32_t addr) {
   case 0xcd0: return EVU_VLEN_BYTES;
   case 0xcd1: return UINT64_C(2) | (UINT64_C(7) << 16) | (UINT64_C(1) << 24) |
     (UINT64_C(1) << 26) | (UINT64_C(1) << 27) | (UINT64_C(1) << 28) | (UINT64_C(1) << 29) |
-    (UINT64_C(1) << 30);
+    (UINT64_C(1) << 30) | (UINT64_C(1) << 31) | (UINT64_C(1) << 32) | (UINT64_C(1) << 33);
   case 0xcd2: return cpu.evu.status;
   case 0xcd3: return cpu.evu.cause;
   case 0xcd4: return cpu.evu.epc;

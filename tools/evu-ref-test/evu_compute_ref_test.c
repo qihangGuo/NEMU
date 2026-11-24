@@ -409,7 +409,19 @@ static void check_low_precision(const char *trace_path) {
     {0x73, 1, 127, 0x3b000000, 0}, {0x73, 0x7e, 127, 0x43e00000, 0},
     {0x74, 0x3f800000, 128, 0x30, 0}, {0x75, 0x3e800000, 127, 0, 3},
     {0x75, 0x3f400000, 127, 2, 1}, {0x75, 0x40a00000, 127, 6, 1},
-    {0x75, 0x7f800000, 127, 7, 5}, {0x75, 0x3f800000, 255, 7, 16}
+    {0x75, 0x7f800000, 127, 7, 5}, {0x75, 0x3f800000, 255, 7, 16},
+    {0x27, 0xbf000000, 127, 0, 1}, {0x27, 0xbf000001, 127, 0, 16},
+    {0x27, 0x437f8000, 127, 255, 16}, {0x28, 0x80, 127, 0xc3000000, 0},
+    {0x29, 0xff, 127, 0x437f0000, 0}, {0x2a, 0xbfa00000, 127, 0xa, 1},
+    {0x2b, 0x7d, 127, 0x7fc00000, 16}, {0x2b, 0xfc, 127, 0xff800000, 0},
+    {0x2c, 0xf, 127, 0xc0c00000, 0}, {0x2c, 8, 127, 0x80000000, 0},
+    {0x2d, 0x007fbfff, 127, 0x0080, 3}, {0x2d, 0x007fc000, 127, 0x0080, 1},
+    {0x2d, 0x7f7f8000, 127, 0x7f80, 5}, {0x2d, 0xff800001, 127, 0x7fc0, 16},
+    {0x2e, 0x8001, 127, 0x80010000, 0}, {0x2e, 0xff81, 127, 0x7fc00000, 16},
+    {0x78, 0x40000000, 128, 0x3c, 0}, {0x78, 0x40000000, 255, 0x7e, 0},
+    {0x79, 0x01, 0, 0x2000, 0}, {0x79, 0x7e, 254, 0x7f800000, 5},
+    {0x7a, 0x01, 0, 0x40, 0}, {0x7a, 0x7d, 255, 0x7fc00000, 16},
+    {0x7b, 0x09, 128, 0xbf800000, 0}, {0x7b, 0x00, 255, 0x7fc00000, 16}
   };
   for (unsigned index = 0; index < sizeof(known) / sizeof(known[0]); ++index) {
     EvuLowpResult result = evu_lowp_convert(known[index][1], known[index][0], known[index][2]);
@@ -419,27 +431,37 @@ static void check_low_precision(const char *trace_path) {
   copy_csrs(saved, false);
   uint8_t source[4 * VLEN_BYTES], other[2 * VLEN_BYTES], expected[4 * VLEN_BYTES], actual[4 * VLEN_BYTES];
   unsigned cases = 0;
-  for (unsigned opcode = 0x70; opcode <= 0x75; ++opcode) {
+  const struct { unsigned opcode, src_bits, dst_bits; bool scaled; } ops[] = {
+    {0x70,32,8,0}, {0x71,32,8,0}, {0x72,32,8,0}, {0x73,8,32,0}, {0x74,32,8,1}, {0x75,32,4,1},
+    {0x27,32,8,0}, {0x28,8,32,0}, {0x29,8,32,0}, {0x2a,32,4,0}, {0x2b,8,32,0}, {0x2c,4,32,0},
+    {0x2d,32,16,0}, {0x2e,16,32,0}, {0x78,32,8,1}, {0x79,8,32,1}, {0x7a,8,32,1}, {0x7b,4,32,1}
+  };
+  for (unsigned op = 0; op < sizeof(ops) / sizeof(ops[0]); ++op) {
+    const unsigned opcode = ops[op].opcode, src_bits = ops[op].src_bits, dst_bits = ops[op].dst_bits;
     for (unsigned mode = 0; mode < 3; ++mode) {
       memset(source, 0, sizeof(source));
       memset(other, 0xff, sizeof(other));
       other[0] = factors[mode];
       for (unsigned element = 0; element < 128; ++element) {
         const uint32_t value = inputs[(element + mode) % (sizeof(inputs) / sizeof(inputs[0]))];
-        if (opcode == 0x73) source[element] = (uint8_t)(element + mode * 64);
-        else memcpy(source + 4 * element, &value, 4);
+        if (src_bits == 4) source[element / 2] |= ((element + mode) & 15) << (4 * (element & 1));
+        else if (src_bits == 8) source[element] = (uint8_t)(element + mode * 64);
+        else if (src_bits == 16) {
+          const uint16_t half = value >> 16;
+          memcpy(source + 2 * element, &half, 2);
+        } else memcpy(source + 4 * element, &value, 4);
       }
       for (unsigned length = 0; length < sizeof(lengths) / sizeof(lengths[0]); ++length) {
         const unsigned vl = lengths[length];
         memset(expected, 0xa5, sizeof(expected));
         unsigned flags = 0;
         for (unsigned element = 0; element < vl; ++element) {
-          uint32_t value = source[element];
-          if (opcode != 0x73) memcpy(&value, source + element * 4, 4);
+          uint32_t value = 0;
+          if (src_bits == 4) value = (source[element / 2] >> (4 * (element & 1))) & 15;
+          else memcpy(&value, source + element * (src_bits / 8), src_bits / 8);
           const EvuLowpResult result = evu_lowp_convert(value, opcode, other[0]);
           flags |= result.flags;
-          if (opcode == 0x73) memcpy(expected + element * 4, &result.bits, 4);
-          else if (opcode != 0x75) expected[element] = result.bits;
+          if (dst_bits != 4) memcpy(expected + element * (dst_bits / 8), &result.bits, dst_bits / 8);
           else if (!(element & 1)) expected[element / 2] = result.bits & 15;
           else expected[element / 2] |= (result.bits & 15) << 4;
         }
@@ -457,7 +479,7 @@ static void check_low_precision(const char *trace_path) {
         write_evu_csr(0x8c1, 0);
         write_evu_csr(0x8c2, 0);
         write_evu_csr(0x8c0, (UINT64_C(1) << 40) | (UINT64_C(16) << 32) | vl);
-        const uint32_t instruction = insn(opcode, 2, 8, opcode >= 0x74 ? 12 : 0, 4);
+        const uint32_t instruction = insn(opcode, 2, 8, ops[op].scaled ? 12 : 0, 4);
         evu(instruction, 0, flags);
         for (unsigned reg = 0; reg < 4; ++reg) read_reg(8 + reg, actual + reg * VLEN_BYTES);
         CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
@@ -478,7 +500,9 @@ static void check_low_precision(const char *trace_path) {
   const unsigned invalid[][5] = {
     {0x70, 1, 0, 8, 0}, {0x71, 2, 1, 8, 0}, {0x72, 2, 7, 8, 0},
     {0x73, 2, 0, 4, 0}, {0x74, 2, 0, 12, 12}, {0x75, 2, 0, 4, 12},
-    {0x70, 2, 0, 8, 12}
+    {0x70, 2, 0, 8, 12}, {0x27, 2, 0, 8, 12}, {0x2e, 2, 0, 4, 0},
+    {0x2d, 1, 0, 8, 0}, {0x2c, 2, 1, 8, 0}, {0x79, 2, 0, 12, 12},
+    {0x7b, 2, 0, 4, 12}, {0x2f, 2, 0, 8, 0}, {0x7c, 2, 0, 8, 0}
   };
   for (unsigned index = 0; index < sizeof(invalid) / sizeof(invalid[0]); ++index) {
     const unsigned *entry = invalid[index];
@@ -488,7 +512,7 @@ static void check_low_precision(const char *trace_path) {
   }
   write_evu_csr(0x8c0, saved[0x8c0]);
   if (trace) fclose(trace);
-  printf("EVU low precision: %u cases, six operations, tails, flags, scales and illegal encodings passed\n", cases);
+  printf("EVU low precision: %u cases, 18 operations, tails, flags, scales and illegal encodings passed\n", cases);
 }
 
 static void check_scalar_fp_forms(void) {
@@ -1268,6 +1292,11 @@ static void check_config_v2(void) {
   CHECK(run_raw(instruction, 128).gpr[12]._64 == 0);
   CHECK(complete(code, instruction, 0, false, 0) == 0);
   // The instruction remains available to enabled S/U; raw EVCFG writes do not.
+#ifdef CONFIG_RV_PMP_CHECK
+  // Allow instruction fetch from the test code in S/U, without granting data access.
+  csr_good(0x3b0, 1, (code >> 18 << 16) | 0x7fff); // 256 KiB NAPOT
+  csr_good(0x3a0, 1, 0x1c); // X | NAPOT
+#endif
   for (unsigned mode = 0; mode <= 1; ++mode) {
     initial.mode = mode;
     CHECK(csr_insn(0x8c0, 1, 0).mcause == 2);
@@ -1299,6 +1328,7 @@ static void check_csr_isolation(void) {
   CHECK((csr_good(0xcd1, 2, 0) & 255) == 2);
   CHECK(((csr_good(0xcd1, 2, 0) >> 8) & 255) == 0);
   CHECK(csr_good(0xcd1, 2, 0) & (UINT64_C(1) << 27));
+  CHECK(((csr_good(0xcd1, 2, 0) >> 29) & 31) == 31);
   CHECK(csr_insn(0xcd0, 1, 0).mcause == 2);
   csr_good(0xbc8, 1, 1);
   const uint64_t enable = UINT64_C(1) << 40;
@@ -1674,7 +1704,7 @@ int main(int argc, char **argv) {
   uint64_t evu_csrs[13];
   CHECK(get_csr(evu_csrs, sizeof(evu_csrs)) == 0);
   CHECK(evu_csrs[0] == 64);
-  CHECK(evu_csrs[1] == UINT64_C(0x40));
+  CHECK(evu_csrs[1] == 0); // setvli_insn(0, ...) requests e8/m1, tail undisturbed.
   CHECK(evu_csrs[4] == 1);
   load_reg(21, UINT64_C(0x80010000), 0);
   read_reg(21, result8);

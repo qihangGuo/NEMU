@@ -4,7 +4,6 @@
 #include "../../local-include/intr.h"
 #include "../rvv/vfexp2.h"
 #include "evu-internal.h"
-#include "lowp.h"
 #include <cpu/cpu.h>
 #include <rtl/fp.h>
 #include <rtl/rtl.h>
@@ -556,15 +555,18 @@ void evu_compute_execute(Decode *s, EvuJob *job) {
     }
   } else if (evu_low_precision(job->opcode)) {
     job->uses_fp = true;
+    const EvuLowpOp op = evu_lowp_op(job->opcode);
+    const bool packed = op.format == EVLP_E2M1;
+    const unsigned low_sew = op.format == EVLP_BF16 ? 1 : 0;
     for (unsigned element = 0; element < vl; ++element) {
-      const bool decode = job->opcode == EVU_CVT_F32_E4M3;
-      const EvuLowpResult converted = evu_lowp_convert(get_element(vs2, element, decode ? 0 : 2),
-        job->opcode, evu_lowp_scaled(job->opcode) ? vs1[0] : 127);
+      const uint32_t source = op.decode && packed ? (vs2[element / 2] >> (4 * (element & 1))) & 15 :
+        get_element(vs2, element, op.decode ? low_sew : 2);
+      const EvuLowpResult converted = evu_lowp_convert(source, job->opcode, op.scaled ? vs1[0] : 127);
       job->flags |= converted.flags;
-      if (job->opcode == EVU_CVT_MXFP4_F32) {
+      if (!op.decode && packed) {
         if (!(element & 1)) job->output[element / 2] = converted.bits & 15;
         else job->output[element / 2] |= (converted.bits & 15) << 4;
-      } else set_element(job->output, element, decode ? 2 : 0, converted.bits);
+      } else set_element(job->output, element, op.decode ? 2 : low_sew, converted.bits);
     }
   } else if (evu_rvv_math(job->opcode)) {
     execute_rvv_math(job, vs2, vs1, vl);

@@ -3,6 +3,7 @@
 
 #include <common.h>
 #include <cpu/difftest/evu.h>
+#include "lowp.h"
 
 #define EVU_VLEN_BITS CONFIG_CUSTOM_EVU_VLEN
 #define EVU_VLEN_BYTES (EVU_VLEN_BITS / 8)
@@ -88,12 +89,6 @@ enum {
   EVU_ZEXT2 = 0x6c,
   EVU_SEXT2 = 0x6d,
   EVU_NSRL_IMM = 0x6e,
-  EVU_CVT_I8_F32 = 0x70,
-  EVU_CVT_E4M3_F32 = 0x71,
-  EVU_CVT_E5M2_F32 = 0x72,
-  EVU_CVT_F32_E4M3 = 0x73,
-  EVU_CVT_MXFP8_F32 = 0x74,
-  EVU_CVT_MXFP4_F32 = 0x75,
   EVU_BLOCK_AMAX = 0x76,
   EVU_BLOCK_PACK = 0x77,
   /* Retired SETMASK opcode 0x4d remains reserved. */
@@ -126,13 +121,6 @@ static inline uint32_t evu_canonical_opcode(uint32_t opcode) {
   case EVU_FREC7_E0: return EVU_FREC7;
   default: return opcode;
   }
-}
-
-static inline bool evu_low_precision(uint32_t opcode) {
-  return opcode >= EVU_CVT_I8_F32 && opcode <= EVU_CVT_MXFP4_F32;
-}
-static inline bool evu_lowp_scaled(uint32_t opcode) {
-  return opcode == EVU_CVT_MXFP8_F32 || opcode == EVU_CVT_MXFP4_F32;
 }
 
 static inline bool evu_rvv_math(uint32_t opcode) {

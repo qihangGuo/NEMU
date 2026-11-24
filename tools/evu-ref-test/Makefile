@@ -8,7 +8,7 @@ CPPFLAGS += -I$(NEMU_HOME)/src/isa/riscv64/instr
 
 all: evu_compute_ref_test
 
-evu_compute_ref_test: evu_compute_ref_test.c
+evu_compute_ref_test: evu_compute_ref_test.c $(NEMU_HOME)/src/isa/riscv64/instr/evu/lowp.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ -ldl -lm
 
 clean:
